@@ -177,3 +177,85 @@ details.cat>summary{grid-template-columns:auto 1fr 100px 60px}
 
 .logo{height:26px;width:auto;display:block}
 @media print{.top{display:none!important}}
+
+/* v9: source filter, catalog health */
+.tabright{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+.srcpick{position:relative}
+#srcBtn{padding:9px 14px;background:var(--card)}
+#srcBtn.on{border-color:var(--accent);color:var(--accent);font-weight:600}
+#srcBtn:disabled{opacity:.5;cursor:default}
+.srcpanel{position:absolute;right:0;top:calc(100% + 6px);z-index:8;background:var(--card);border:1px solid var(--line);border-radius:12px;box-shadow:0 8px 24px rgba(0,0,0,.15);padding:10px 14px;width:min(420px,calc(100vw - 32px));max-height:60vh;overflow:auto}
+.srcpanel[hidden]{display:none}
+.srctop{display:flex;justify-content:space-between;align-items:center;gap:8px;border-bottom:1px solid var(--line);padding-bottom:4px}
+.srctop .linkbtn{padding:2px 0}
+.srcgroup{padding:6px 0;border-bottom:1px solid var(--line)}
+.srcgroup:last-child{border-bottom:0}
+.srchead{display:grid;grid-template-columns:auto 1fr auto;margin:4px 0}
+.srcrow2{display:grid;grid-template-columns:auto 1fr auto auto;margin:2px 0 2px 22px;font-size:14px}
+.srcrow2 .nm{word-break:break-all}
+.htable td.rt,.htable th.rt{text-align:right}
+.htable .barcell{width:110px}
+.htable .barcell i{display:block;height:8px;border-radius:4px;background:var(--accent);opacity:.6}
+.htable td.warn,.warn{color:var(--warn)}
+#healthPanel h4{margin:16px 0 4px;font-size:15px}
+#hNote:empty{display:none}
+.srcpanel.left{right:auto;left:0}
+
+/* v10: lineage explorer and impact analysis */
+#xSearch{width:100%;padding:10px 12px;border:1px solid var(--line);border-radius:10px;font:inherit;background:var(--bg);color:var(--ink);margin:8px 0 4px}
+.xcols{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:14px;margin-top:8px}
+@media (max-width:900px){.xcols{grid-template-columns:1fr}}
+.xcol{border:1px solid var(--line);border-radius:12px;overflow:hidden;display:flex;flex-direction:column;min-width:0}
+.xhead{display:flex;justify-content:space-between;gap:8px;padding:10px 12px;font-weight:700;font-size:14px;border-top:4px solid var(--c);background:var(--bg)}
+.xhead .ct{color:var(--muted);font-weight:600}
+.xlist{max-height:420px;overflow:auto;padding:4px}
+.xitem{display:flex;flex-direction:column;align-items:flex-start;width:100%;text-align:left;background:transparent;border:1px solid transparent;border-radius:8px;padding:6px 8px;color:var(--ink);gap:1px}
+.xitem:hover{background:var(--bg)}
+.xitem.on{border-color:var(--c);background:color-mix(in srgb,var(--c) 10%,transparent)}
+.xitem .xn{font-weight:600;font-size:14px;word-break:break-all}
+.xitem .xs{font-size:12px;color:var(--muted);word-break:break-all}
+.xitem .badge{margin-left:6px}
+.xmore,.xempty{padding:6px 12px}
+.xsel{display:flex;flex-wrap:wrap;align-items:baseline;gap:4px 10px;padding:8px 12px;border-left:4px solid var(--c);background:var(--bg);border-radius:8px;margin:6px 0 10px}
+.xsel b{font-size:17px;word-break:break-all}
+.lanes{display:grid;grid-template-columns:minmax(0,1fr) minmax(120px,200px) minmax(0,1fr);gap:14px;align-items:start;margin:8px 0}
+@media (max-width:800px){.lanes{grid-template-columns:1fr}}
+.lane h4{margin:0 0 6px;font-size:14px;color:var(--muted)}
+.lane.mid{align-self:center;text-align:center}
+.xnode{border:2px solid var(--c);border-radius:12px;padding:12px;font-weight:700;word-break:break-all;background:color-mix(in srgb,var(--c) 8%,transparent)}
+.lgroup{border:1px solid var(--line);border-left:4px solid var(--c);border-radius:10px;padding:6px 10px;margin-bottom:8px}
+.lgh{display:flex;justify-content:space-between;gap:8px;font-size:13px;font-weight:600;margin-bottom:2px}
+.lnode{display:flex;justify-content:space-between;gap:8px;font-size:13px;padding:2px 0;border-top:1px solid var(--line)}
+.lnode span:first-child{word-break:break-all}
+.lnode.go{cursor:pointer;color:var(--accent)}
+.lnode.go:hover span:first-child{text-decoration:underline}
+.tlink{padding:0;font-weight:500;text-align:left}
+#xImpact h4{margin:16px 0 4px;font-size:15px}
+#xImpact .lane h4{margin:0 0 6px}
+#xNote p{margin:4px 0}
+
+/* v11: overview stat cards */
+:root{--s-impact:#f4511e;--s-top:#1e1b4b;--s-cross:#4f5bd5;--s-depth:#16a34a;--s-health:#f4511e;--stat-bg:#eef0fb}
+@media (prefers-color-scheme:dark){:root{--s-top:#a5b4fc;--stat-bg:#1d2130}}
+.statcards{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:12px;margin-bottom:16px}
+.stat{background:var(--stat-bg);border-radius:10px;padding:12px 16px 12px 18px;border-left:6px solid var(--sc);box-shadow:0 1px 3px rgba(0,0,0,.12);min-width:0}
+.stat.s-impact{--sc:var(--s-impact)}.stat.s-top{--sc:var(--s-top)}.stat.s-cross{--sc:var(--s-cross)}.stat.s-depth{--sc:var(--s-depth)}.stat.s-health{--sc:var(--s-health)}
+.stat .st{font-weight:700;font-size:15px}
+.stat .sv{font-size:26px;font-weight:800;line-height:1.2;margin:2px 0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.stat .ss{font-size:12px;color:var(--muted)}
+.stat[data-statgo]{cursor:pointer}
+.stat[data-statgo]:hover .sname{text-decoration:underline}
+@media (max-width:520px){.conn,.conn.head{grid-template-columns:minmax(0,1fr) 60px 70px 70px;gap:8px;font-size:13px}.conn .tl{overflow:hidden;text-overflow:ellipsis}}
+.grid2>*{min-width:0}
+@media (max-width:980px){.grid2{grid-template-columns:minmax(0,1fr)}}
+.ovhead{flex-wrap:wrap;gap:4px 12px}
+@media (max-width:520px){.toolrow{grid-template-columns:minmax(0,1fr) 56px 70px 48px;gap:6px;padding-left:6px;font-size:13px}details.cat>summary{grid-template-columns:auto minmax(0,1fr) 80px 48px;gap:8px}.cattotal{grid-template-columns:minmax(0,1fr) 80px 48px}}
+
+/* v12: tabs above the numbers; number tiles styled like the stat cards */
+:root{--k1:#2563eb;--k2:#4f5bd5;--k3:#0d9488;--k4:#dc2626;--k5:#16a34a}
+.kpi{background:var(--stat-bg);border-radius:10px;padding:12px 16px 12px 18px;border-left:6px solid var(--sc,var(--accent));box-shadow:0 1px 3px rgba(0,0,0,.12)}
+.kpis .kpi:nth-child(1){--sc:var(--k1)}.kpis .kpi:nth-child(2){--sc:var(--k2)}.kpis .kpi:nth-child(3){--sc:var(--k3)}.kpis .kpi:nth-child(4){--sc:var(--k4)}.kpis .kpi:nth-child(5){--sc:var(--k5)}
+.kpi .kl{font-weight:700;font-size:15px;color:var(--ink)}
+.kpi .kv{font-size:26px;font-weight:800;line-height:1.2;margin:2px 0}
+.kpi .kd{font-size:12px}
+.kpis{grid-template-columns:repeat(auto-fit,minmax(210px,1fr))}
