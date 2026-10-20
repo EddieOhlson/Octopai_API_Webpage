@@ -1,0 +1,202 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Lineage Scan</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<header class="top">
+  <div class="brand">Lineage Scan <span class="sub">Octopai / Cloudera Data Lineage</span></div>
+</header>
+
+<main>
+  <section id="loginCard" class="card narrow">
+    <h2>Connect to a site</h2>
+    <p class="muted">Use the same login as your Octopai site. The password is sent only to that site and is never saved.</p>
+    <form id="loginForm">
+      <label>Site <span class="hint">e.g. iqvia, for iqvia.octopai.com</span>
+        <input id="tenant" required autocomplete="off" placeholder="company">
+      </label>
+      <label>Username <input id="username" required autocomplete="username"></label>
+      <label>Password <input id="password" type="password" required autocomplete="current-password"></label>
+      <button type="submit" class="primary" id="loginBtn">Connect</button>
+      <p id="loginError" class="error" role="alert"></p>
+    </form>
+  </section>
+
+  <section id="appView" hidden>
+    <!-- Header: session, freshness, actions -->
+    <div class="card dashhead" id="catalogCard">
+      <div id="session" class="pill">
+        <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><circle cx="12" cy="12" r="10"/><path d="M8 12.5l3 3 5-6"/></svg>
+        <div><div class="pname" id="userName"></div><div><span id="tenantName" class="muted"></span> <span id="timer" class="timer"></span></div></div>
+      </div>
+      <div class="headright">
+        <span id="fresh2" class="freshchip muted small"></span>
+        <button id="catalogBtn" class="primary" type="button">Reload assets and events</button>
+        <button id="dlReopen" class="ghost" type="button" hidden>Download lineage…</button>
+        <button id="logout" class="ghost" type="button">Disconnect</button>
+      </div>
+    </div>
+
+    <!-- KPI strip -->
+    <div id="kpis" class="kpis"></div>
+    <p id="catWarn" class="warnbox small" hidden></p>
+
+    <!-- Tabs + asset type switch -->
+    <div class="tabbar noprint">
+      <div class="tabs" role="tablist">
+        <button class="tab" role="tab" data-tab="overview">Overview</button>
+        <button class="tab" role="tab" data-tab="orphans">Orphans &amp; Health <span id="tabOrph" class="tabbadge" hidden></span></button>
+        <button class="tab" role="tab" data-tab="users">Users &amp; Activity <span id="tabEv" class="tabbadge" hidden></span></button>
+        <button class="tab" role="tab" data-tab="download">Lineage Download</button>
+        <button class="tab" role="tab" data-tab="scan">Keyword Scan</button>
+      </div>
+      <div class="seg" id="typeSeg" role="radiogroup" aria-label="Asset type">
+        <label><input type="radio" name="bdtype" value="1" checked><span>Cross-system</span></label>
+        <label><input type="radio" name="bdtype" value="2"><span>Column-level</span></label>
+      </div>
+    </div>
+
+    <!-- Overview -->
+    <section class="panel" data-panel="overview">
+      <div class="grid2">
+        <div class="card">
+          <div class="ovhead"><h2>Connections <span id="connHead" class="muted small"></span></h2><span id="catState" class="muted small"></span></div>
+          <p class="muted small">Bar length is square-root scaled so small connections stay visible next to very large ones.</p>
+          <div class="conn head muted"><span>Connection</span><span class="tl">Tool</span><span class="ct">Column-level</span><span class="ct">Cross-system</span></div>
+          <div id="conns"></div>
+          <button id="moreConns" class="linkbtn" type="button" hidden></button>
+        </div>
+        <div class="card">
+          <div class="ovhead"><h2>Breakdown by category</h2></div>
+          <div id="bd"></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- Orphans -->
+    <section class="panel" data-panel="orphans" hidden>
+      <div class="card" id="orphanBlock">
+        <div class="ovhead"><h2>Orphans &amp; broken lineage</h2><span class="muted small">for the asset type selected above</span></div>
+        <div id="orph"></div>
+      </div>
+    </section>
+
+    <!-- Users -->
+    <section class="panel" data-panel="users" hidden>
+      <div class="card">
+        <div class="ovhead"><h2>User Events</h2><span id="evState" class="muted small"></span></div>
+        <div id="evBody" class="muted">Waiting…</div>
+      </div>
+    </section>
+
+    <!-- Lineage download -->
+    <section class="panel" data-panel="download" hidden>
+      <div class="card" id="dlEmpty">
+        <h2>Lineage download</h2>
+        <p class="muted">Download the lineage graphs for your assets to find confirmed orphans and broken links. Results are saved on this computer and also feed the local keyword scan.</p>
+        <button id="dlOpen" class="primary" type="button">Choose what to download…</button>
+      </div>
+      <div class="card prompt" id="lineagePrompt" hidden>
+        <h2>Download lineage?</h2>
+        <p id="promptSummary"></p>
+        <div class="opts">
+          <fieldset><legend>Which assets</legend>
+            <label class="check"><input type="checkbox" id="optT2"> <span id="optT2Label">Column-level</span></label>
+            <label class="check"><input type="checkbox" id="optT1"> <span id="optT1Label">Cross-system</span></label>
+          </fieldset>
+          <fieldset><legend>Which direction</legend>
+            <label class="check"><input type="checkbox" id="optUp" checked> Upstream (sources)</label>
+            <label class="check"><input type="checkbox" id="optDown" checked> Downstream (consumers)</label>
+          </fieldset>
+          <fieldset><legend>Limit (optional)</legend>
+            <label class="check small">Only the first <input id="optLimit" type="number" min="1" placeholder="all" class="narrownum"> assets per type</label>
+          </fieldset>
+        </div>
+        <p id="promptEstimate" class="muted small"></p>
+        <div class="btnrow">
+          <button id="dlStart" class="primary" type="button">Yes, download lineage</button>
+          <button id="dlLater" class="ghost" type="button">Not now</button>
+        </div>
+      </div>
+      <div class="card" id="dlCard" hidden>
+        <div class="ovhead"><h2>Lineage download</h2><span id="dlState" class="muted small"></span></div>
+        <div class="bar big"><div id="dlBar"></div></div>
+        <div id="dlStats" class="muted small"></div>
+        <div class="btnrow">
+          <button id="dlCancel" class="ghost" type="button">Stop</button>
+          <a id="dlJson" class="linkbtn" hidden download>Download JSON lines</a>
+          <a id="dlCsv" class="linkbtn" hidden download>Download CSV</a>
+        </div>
+        <p id="dlNote" class="muted small"></p>
+      </div>
+    </section>
+
+    <!-- Keyword scan -->
+    <section class="panel" data-panel="scan" hidden>
+      <div class="card">
+        <h2>Keyword lineage scan</h2>
+        <form id="scanForm" class="scanrow">
+          <input id="keywords" required placeholder="e.g. email, customer_id, ssn" autocomplete="off">
+          <div class="seg" role="radiogroup" aria-label="Lineage direction">
+            <label><input type="radio" name="mode" value="source" checked><span>Source columns</span></label>
+            <label><input type="radio" name="mode" value="consumer"><span>Consumer columns</span></label>
+          </div>
+          <button class="primary" id="scanBtn" type="submit">Scan</button>
+          <button class="ghost" id="cancelBtn" type="button" hidden>Cancel</button>
+        </form>
+        <p class="muted small" id="modeHelp"></p>
+        <div class="chips" id="chips"></div>
+        <div class="srcrow"><span class="muted small">Search in</span>
+          <div class="seg" role="radiogroup" aria-label="Where to search">
+            <label><input type="radio" name="src" value="local" checked><span>Local files</span></label>
+            <label><input type="radio" name="src" value="live"><span>Live from Octopai</span></label>
+          </div>
+        </div>
+        <p class="muted small" id="localNote"></p>
+        <label class="check small"><input type="checkbox" id="fresh"> Ignore cached lineage (refetch everything)</label>
+        <p class="muted small" id="cacheNote"></p>
+      </div>
+
+      <div id="results" class="card" hidden>
+        <div class="reporthead" id="reportHead"></div>
+        <div class="summary">
+          <div id="summaryText" class="big"></div>
+          <div class="bar"><div id="bar"></div></div>
+          <div id="status" class="muted small"></div>
+        </div>
+        <div class="actions noprint">
+          <button class="ghost" id="csvBtn">Download CSV</button>
+          <button class="ghost" id="printBtn">Save as PDF</button>
+          <button class="ghost" id="fetchMissing" type="button" hidden></button>
+        </div>
+        <div id="groups"></div>
+      </div>
+    </section>
+  </section>
+</main>
+
+<!-- Shown when the token expires mid-run so long downloads can continue without losing anything -->
+<div id="reauth" class="overlay" hidden>
+  <form id="reauthForm" class="card narrow">
+    <h2>Session expired</h2>
+    <p class="muted">Your token ran out. Enter your password to continue. Nothing already downloaded is lost.</p>
+    <label>Username <input id="reauthUser" readonly></label>
+    <label>Password <input id="reauthPass" type="password" autocomplete="current-password" required></label>
+    <div class="btnrow"><button class="primary" type="submit">Continue</button><button class="ghost" type="button" id="reauthCancel">Disconnect</button></div>
+    <p id="reauthError" class="error" role="alert"></p>
+  </form>
+</div>
+<footer id="statusBar" class="statusbar" hidden>
+  <div class="statusin">
+    <div class="ptext"><span id="catText"></span><span id="catTime"></span></div>
+    <div class="bar"><div id="catBar"></div></div>
+  </div>
+</footer>
+<script src="categories.js"></script>
+<script src="app.js"></script>
+</body>
+</html>

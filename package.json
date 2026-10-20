@@ -1,0 +1,8 @@
+{
+  "name": "api_webpage",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Octopai / Cloudera Data Lineage tenant explorer with per-tenant catalog cache",
+  "type": "module",
+  "scripts": { "start": "node server.js" }
+}
