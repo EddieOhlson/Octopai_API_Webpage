@@ -33,7 +33,7 @@ To use a different port: `PORT=5200 npm start`.
 
 ## Using it
 
-1. Enter the site name, for example `iqvia` for `iqvia.octopai.com`. For regional sites, enter `demo.eu` for `demo.eu.octopai.com`.
+1. Enter the site name, for example `demo` for `demo.octopai.com`. For regional sites, enter `demo.eu` for `demo.eu.octopai.com`.
 2. Log in with your Octopai username and password.
 3. The catalog and user events load first. Use the tabs to explore, and the Cross-system / Column-level switch to change which asset type the breakdown and orphans describe.
 4. Optional: open **Lineage Download** to download lineage. This finds confirmed orphans and broken links, and it feeds the local keyword scan.

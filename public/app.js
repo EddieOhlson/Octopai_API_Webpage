@@ -113,7 +113,7 @@ async function doLogin(username, password) {
 $('#loginForm').addEventListener('submit', async (e) => {
   e.preventDefault()
   const tenant = $('#tenant').value.trim().toLowerCase().replace(/^https?:\/\//, '').replace(/\/.*$/, '').replace(/\.octopai\.com.*$/, '')
-  if (!/^[a-z0-9-]+(\.[a-z0-9-]+)*$/.test(tenant)) { $('#loginError').textContent = 'Enter just the site name, like "iqvia" or "demo.eu".'; return }
+  if (!/^[a-z0-9-]+(\.[a-z0-9-]+)*$/.test(tenant)) { $('#loginError').textContent = 'Enter just the site name, like "demo" or "demo.eu".'; return }
   state.tenant = tenant; state.token = ''
   $('#loginBtn').disabled = true; $('#loginError').textContent = ''
   try {
