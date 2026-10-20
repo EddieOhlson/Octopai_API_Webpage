@@ -174,3 +174,6 @@ details.cat>summary{grid-template-columns:auto 1fr 100px 60px}
 #dlEmpty{display:block}
 .panel:has(#lineagePrompt:not([hidden])) #dlEmpty,.panel:has(#dlCard:not([hidden])) #dlEmpty{display:none}
 @media print{.kpis,.tabbar,.dashhead{display:none!important}.panel{display:none!important}.panel[data-panel=scan]{display:block!important}.panel[data-panel=scan] .card:not(#results){display:none!important}}
+
+.logo{height:26px;width:auto;display:block}
+@media print{.top{display:none!important}}
