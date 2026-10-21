@@ -13,13 +13,8 @@ const MAX_PAGES = 500         // safety cap on asset pages
 const ORPHAN_CAP = 50000     // most orphans kept in memory per asset type
 const FIND_CAP = 5000        // most broken-lineage findings kept per kind
 const EVENT_PAGE = 500
-const REQ_TIMEOUT_MS = 3 * 60 * 1000   // a request Octopai has not answered within this is cancelled and retried
 const MAX_EVENT_PAGES = 400
 const CACHE_MAX_AGE_MS = 24 * 60 * 60 * 1000
-// At login, assets and user events are read from the files saved in data/ when they are younger than this.
-// Older than this (or missing) and they are reloaded from Octopai. Reload assets and events always reloads.
-// Set to Infinity to never reload automatically, or 0 to always reload at login.
-const SAVED_MAX_AGE_HOURS = 24 * 10   // 10 days
 const TYPE_NAME = { 1: 'cross-system', 2: 'column-level' }
 const DIR_NAME = { 1: 'upstream', 2: 'downstream' }
 const PRESETS = ['email', 'ssn', 'phone', 'customer_id', 'address', 'birth', 'salary', 'account']
@@ -73,13 +68,11 @@ async function api(path, { method = 'POST', body, signal } = {}) {
     const headers = { 'Content-Type': 'application/json', 'X-Octopai-Host': `${state.tenant}.octopai.com` }
     if (used && !isLogin) headers.Authorization = `Bearer ${used}`
     let res
-    // Each try gets its own time limit, so one request that Octopai never answers cannot stall a load forever.
-    const sig = signal ? AbortSignal.any([signal, AbortSignal.timeout(REQ_TIMEOUT_MS)]) : AbortSignal.timeout(REQ_TIMEOUT_MS)
     try {
-      res = await fetch(`/octopai${path}`, { method, headers, body: body ? JSON.stringify(body) : undefined, signal: sig })
+      res = await fetch(`/octopai${path}`, { method, headers, body: body ? JSON.stringify(body) : undefined, signal })
     } catch (e) {
-      if (signal?.aborted) throw e
-      why = e.name === 'TimeoutError' ? `Octopai did not answer within ${REQ_TIMEOUT_MS / 60000} minutes` : 'Could not reach the local server or the Octopai site.'
+      if (e.name === 'AbortError') throw e
+      why = 'Could not reach the local server or the Octopai site.'
       await sleep(1000 * 2 ** (attempt - 1), signal); continue
     }
     if (res.status === 401 && !isLogin) {
@@ -97,11 +90,7 @@ async function api(path, { method = 'POST', body, signal } = {}) {
       throw new Error(`HTTP ${res.status} ${txt.slice(0, 200)}`)
     }
     if (res.status === 204) return {}
-    try { return await res.json() } catch (e) {
-      if (signal?.aborted) throw e
-      why = e.name === 'TimeoutError' ? `Octopai did not finish sending within ${REQ_TIMEOUT_MS / 60000} minutes` : 'Octopai sent an incomplete answer'
-      await sleep(1000 * 2 ** (attempt - 1), signal); continue
-    }
+    return res.json()
   }
   throw new Error(`Gave up after 5 tries (${why}).`)
 }
@@ -160,7 +149,6 @@ async function enterApp() {
   $('#userName').textContent = state.user
   document.title = `Lineage Scan · ${state.tenant}`
   state.showAllConns = false; state.dl = null; state.local = null; state.srcTouched = false
-  srcFilter.off = loadFilter(); coverage.data = {}; fvMemo.clear(); itemsMemo.clear(); healthMemo.clear(); xMemo.clear(); statsMemo.clear(); xUi.imp = null; xUi.q = ''; $('#xSearch').value = ''; buildSources()
   $('#dlCard').hidden = true; $('#lineagePrompt').hidden = true; $('#dlReopen').hidden = true
   await loadCache()
   { let t = 'overview'; try { t = localStorage.getItem('lineage-tab') || t } catch { /* none */ } setTab(document.querySelector(`.tab[data-tab=${t}]`) ? t : 'overview') }
@@ -179,7 +167,7 @@ function disconnect() {
   document.title = 'Lineage Scan'
 }
 $('#logout').addEventListener('click', disconnect)
-window.addEventListener('beforeunload', (e) => { if (state.dl?.status === 'running' || state.saving) { e.preventDefault(); e.returnValue = '' } })
+window.addEventListener('beforeunload', (e) => { if (state.dl?.status === 'running') { e.preventDefault(); e.returnValue = '' } })
 
 function tick() {
   if (!state.token) return
@@ -226,7 +214,6 @@ async function pageAssets(baseBody, signal, onItems, workers = PAGE_WORKERS) {
       const offset = nextPage++ * PAGE
       const resp = await api('/api/v2.0/assets/query', { signal, body: { ...baseBody, limit: PAGE, offset } })
       const items = resp.items || []
-      state.lastProgress = Date.now()
       const fresh = items.filter((x) => { const k = x && x._key; if (k == null) return !!x; if (seen.has(k)) return false; seen.add(k); return true })
       pages++
       if (fresh.length) onItems(fresh, seen.size)
@@ -246,161 +233,63 @@ async function findColumns(names, signal, onPage) {
 const newAssets = (t) => ({ t, running: true, total: 0, tools: new Set(), dbs: new Set(), schemas: new Set(), conns: new Map(), combos: new Map(), items: [], linkCounted: 0, orphanTotal: 0, orphans: [], orphanCombos: new Map(), sources: 0, endpoints: 0, flagged: 0, flaggedList: [], done: false, hitCap: false, error: '' })
 const newEvents = () => ({ running: true, rows: [], skipped: '', error: '', done: false, hitCap: false })
 
-async function startLoad({ force = false } = {}) {
+async function startLoad() {
   if (!state.token || state.loading) return
   state.loading = true
   state.loadAbort?.abort()
   const ac = state.loadAbort = new AbortController()
-  state.loadStartedAt = Date.now(); state.loadFinishedAt = 0; state.lastProgress = Date.now(); state.saveNote = ''
-  state.assets = { 1: newAssets(1), 2: newAssets(2) }; state.events = newEvents(); state.fromSaved = 0
+  state.loadStartedAt = Date.now(); state.loadFinishedAt = 0
+  state.assets = { 1: newAssets(1), 2: newAssets(2) }; state.events = newEvents()
   $('#catalogBtn').disabled = true; $('#catalogBtn').textContent = 'Loading…'
   $('#lineagePrompt').hidden = true; $('#dlReopen').hidden = true
   renderOverview(); renderEvents()
-  const timer = setInterval(() => {
-    renderOverview()
-    if (state.tab === 'explorer' && !state.assets[selType()]?.done) renderExplorer()
-    if (state.tab === 'health' && !state.assets[selType()]?.done) renderHealth()
-  }, 1000)
-  // Each asset type comes from its saved file when that is fresh enough, otherwise from Octopai.
-  const useSaved = { 1: false, 2: false }
-  let savedEvents = false
+  const timer = setInterval(renderOverview, 1000)
   try {
-    if (!force) {
-      for (const t of [1, 2]) {
-        useSaved[t] = !!(await readSaved(t, ac.signal, SAVED_MAX_AGE_HOURS * 3600 * 1000))
-        if (!useSaved[t]) state.assets[t] = newAssets(t)
-      }
-      savedEvents = await loadSavedEvents(ac.signal)
-    }
-    await Promise.all([
-      useSaved[1] ? null : loadAssets(1, ac.signal), useSaved[2] ? null : loadAssets(2, ac.signal),
-      savedEvents ? null : loadEvents(ac.signal),
-    ])
-    // A live load that failed falls back to the saved copy, however old, so the page is never left empty.
-    for (const t of [1, 2]) {
-      const a = state.assets[t]
-      if (a.done || !a.error) continue
-      let fb = null
-      try { fb = await readSaved(t, ac.signal) } catch { fb = null }
-      if (fb) fb.fallback = a.error
-      else state.assets[t] = a
-    }
-  } catch (err) { if (err.name !== 'AbortError') throw err } finally { clearInterval(timer) }
+    await Promise.all([loadAssets(1, ac.signal), loadAssets(2, ac.signal), loadEvents(ac.signal)])
+  } finally { clearInterval(timer) }
   if (ac.signal.aborted) { state.loading = false; return }
-  const usedSaved = [1, 2].filter((t) => state.assets[t].savedAt)
-  state.fromSaved = usedSaved.length ? Math.min(...usedSaved.map((t) => state.assets[t].savedAt)) : 0
-  const liveTypes = [1, 2].filter((t) => !state.assets[t].savedAt && state.assets[t].done)
-  if (!savedEvents && state.events.done) fetch(`/events/${state.tenant}`, { method: 'PUT', body: JSON.stringify({ savedAt: Date.now(), rows: state.events.rows }) }).catch(() => {})
   state.loadFinishedAt = Date.now(); state.loading = false
   const types = {}
-  for (const t of liveTypes) { const a = state.assets[t]; types[t] = { total: a.total, tools: a.tools.size, dbs: a.dbs.size, schemas: a.schemas.size, conns: [...a.conns.values()], combos: [...a.combos.values()], orph: orphSummary(a) } }
-  if (liveTypes.length) {
-    const old = state.cache.catalog
-    const prev = old?.types ? { savedAt: old.savedAt, totals: { 1: old.types[1]?.total, 2: old.types[2]?.total } } : old?.prev
-    state.cache.catalog = { savedAt: Date.now(), prev, types: { ...(state.cache.catalog?.types || {}), ...types }, events: state.events.done ? { total: state.events.rows.length } : state.cache.catalog?.events }
-    state.cacheDirty = true; saveCache()
-    saveAssetsLocal(liveTypes)
-  }
+  for (const t of [1, 2]) { const a = state.assets[t]; if (a.done) types[t] = { total: a.total, tools: a.tools.size, dbs: a.dbs.size, schemas: a.schemas.size, conns: [...a.conns.values()], combos: [...a.combos.values()], orph: orphSummary(a) } }
+  const old = state.cache.catalog
+  const prev = old?.types ? { savedAt: old.savedAt, totals: { 1: old.types[1]?.total, 2: old.types[2]?.total } } : old?.prev
+  state.cache.catalog = { savedAt: Date.now(), prev, types: { ...(state.cache.catalog?.types || {}), ...types }, events: state.events.done ? { total: state.events.rows.length } : state.cache.catalog?.events }
+  state.cacheDirty = true; saveCache()
+  saveAssetsLocal()
   $('#catalogBtn').disabled = false; $('#catalogBtn').textContent = 'Reload assets and events'
-  fvMemo.clear(); itemsMemo.clear(); healthMemo.clear(); xMemo.clear(); statsMemo.clear(); coverage.data = {}
-  buildSources(); renderOverview(); renderEvents(); if (state.tab === 'health') renderHealth(); if (state.tab === 'explorer') renderExplorer()
+  renderOverview(); renderEvents()
   showPrompt()
 }
-$('#catalogBtn').addEventListener('click', () => startLoad({ force: true }))
-
-// Adds one asset to the running totals. Used both for assets from Octopai and for assets read back from data/.
-function ingest(a, item) {
-  a.total++
-  if (item.tool) a.tools.add(item.tool)
-  if (item.d) a.dbs.add(item.d)
-  if (item.d || item.s) a.schemas.add(`${item.d}.${item.s}`)
-  const c = a.conns.get(item.c) || { name: item.c, tool: item.tool, tt: item.tt, count: 0 }
-  c.count++; a.conns.set(item.c, c)
-  const ck = [item.tool, item.tt, item.ot, item.ct].join('\u0001')
-  const cb = a.combos.get(ck) || { tool: item.tool, toolType: item.tt, objectType: item.ot, container: item.ct, count: 0 }
-  cb.count++; a.combos.set(ck, cb)
-  if (item.k) a.items.push(item)
-  if (item.ins != null && item.outs != null) {
-    a.linkCounted++
-    if (item.ins === 0 && item.outs === 0) {
-      a.orphanTotal++; if (a.orphans.length < ORPHAN_CAP) a.orphans.push(item)
-      const oc = a.orphanCombos.get(ck) || { tool: item.tool, toolType: item.tt, objectType: item.ot, container: item.ct, count: 0 }
-      oc.count++; a.orphanCombos.set(ck, oc)
-    } else if (item.ins === 0) a.sources++
-    else if (item.outs === 0) a.endpoints++
-  }
-  if (item.fo) { a.flagged++; if (a.flaggedList.length < ORPHAN_CAP) a.flaggedList.push(item) }
-}
-
-// Saved asset lists in data/ (see server.js for the format). The file is read as a stream and parsed in batches, so
-// lists with millions of assets never have to fit in one string. Returns null (and leaves nothing half-loaded) when
-// there is no saved list, it is older than maxAgeMs, or it was written by a version without the schema fields.
-function savedRowToItem(row, dict) {
-  if (!Array.isArray(row)) return row
-  const [k, n, c, tool, tt, ot, ct, d, sc, tb, ins, outs, fo] = row
-  const D = (i) => dict[i] ?? ''
-  const item = { k, n, c: D(c), tool: D(tool), tt: D(tt), ot: D(ot), ct: D(ct), d: D(d), s: D(sc), tb: D(tb), ins, outs }
-  item.l = [item.d, item.s, item.tb, n].filter(Boolean).join('.') || String(k)
-  if (fo) item.fo = true
-  return item
-}
-async function readSaved(t, signal, maxAgeMs = Infinity) {
-  const r = await fetch(`/assets/${state.tenant}/${t}`, { signal })
-  if (!r.ok || !r.body) return null
-  const reader = r.body.pipeThrough(new TextDecoderStream()).getReader()
-  let buf = '', meta = null, dict = null, a = null
-  try {
-    for (;;) {
-      const { value, done } = await reader.read()
-      if (value) buf += value
-      const cut = done ? buf.length : buf.lastIndexOf('\n')
-      if (cut < 0) continue
-      const lines = buf.slice(0, cut).split('\n'); buf = buf.slice(cut + 1)
-      const rows = []
-      for (const L of lines) {
-        if (!L) continue
-        if (!meta) {
-          meta = JSON.parse(L).meta
-          if (!meta?.savedAt || !(meta.v >= 2) || Date.now() - meta.savedAt > maxAgeMs) { reader.cancel().catch(() => {}); return null }
-          a = state.assets[t] = newAssets(t); a.reading = true
-          continue
-        }
-        if (meta.v >= 3 && !dict) { dict = JSON.parse(L).dict || []; continue }
-        rows.push(L)
-      }
-      if (rows.length) for (const row of JSON.parse(`[${rows.join(',')}]`)) ingest(a, savedRowToItem(row, dict))
-      if (done) break
-    }
-  } catch (err) {
-    reader.cancel().catch(() => {})
-    if (a) state.assets[t] = newAssets(t)
-    if (err.name === 'AbortError') throw err
-    return null
-  }
-  if (!a) return null
-  a.done = true; a.running = false; a.reading = false; a.savedAt = meta.savedAt
-  return a
-}
-async function loadSavedEvents(signal) {
-  try {
-    const r = await fetch(`/events/${state.tenant}`, { signal })
-    if (!r.ok) return false
-    const j = await r.json()
-    if (!j.savedAt || Date.now() - j.savedAt > SAVED_MAX_AGE_HOURS * 3600 * 1000 || !Array.isArray(j.rows)) return false
-    Object.assign(state.events, { rows: j.rows, running: false, done: true, savedAt: j.savedAt })
-    return true
-  } catch { return false }
-}
+$('#catalogBtn').addEventListener('click', startLoad)
 
 async function loadAssets(t, signal) {
   const a = state.assets[t]
   try {
     const pg = await pageAssets({ assetType: t }, signal, (items) => {
       for (const raw of items) {
+        a.total++
         const x = normalizeAsset(raw)
-        const item = { k: x.key, l: colPath(x) || String(x.key), n: x.column, c: x.connection, tool: x.tool, tt: x.toolType, ot: x.objectType, ct: x.container, ins: numOrNull(pick(raw, 'ins', 'inCount')), outs: numOrNull(pick(raw, 'outs', 'outCount')), d: x.db, s: x.schema, tb: x.table }
-        if (pick(raw, 'isSrcColumnOrphan') === true) item.fo = true
-        ingest(a, item)
+        if (x.tool) a.tools.add(x.tool)
+        if (x.db) a.dbs.add(x.db)
+        if (x.db || x.schema) a.schemas.add(`${x.db}.${x.schema}`)
+        const c = a.conns.get(x.connection) || { name: x.connection, tool: x.tool, count: 0 }
+        c.count++; a.conns.set(x.connection, c)
+        const ck = [x.tool, x.toolType, x.objectType, x.container].join('\u0001')
+        const cb = a.combos.get(ck) || { tool: x.tool, toolType: x.toolType, objectType: x.objectType, container: x.container, count: 0 }
+        cb.count++; a.combos.set(ck, cb)
+        const ins = numOrNull(pick(raw, 'ins', 'inCount')), outs = numOrNull(pick(raw, 'outs', 'outCount'))
+        const item = { k: x.key, l: colPath(x) || String(x.key), n: x.column, c: x.connection, tool: x.tool, tt: x.toolType, ot: x.objectType, ct: x.container, ins, outs }
+        if (x.key) a.items.push(item)
+        if (ins !== null && outs !== null) {
+          a.linkCounted++
+          if (ins === 0 && outs === 0) {
+            a.orphanTotal++; if (a.orphans.length < ORPHAN_CAP) a.orphans.push(item)
+            const oc = a.orphanCombos.get(ck) || { tool: x.tool, toolType: x.toolType, objectType: x.objectType, container: x.container, count: 0 }
+            oc.count++; a.orphanCombos.set(ck, oc)
+          } else if (ins === 0) a.sources++
+          else if (outs === 0) a.endpoints++
+        }
+        if (pick(raw, 'isSrcColumnOrphan') === true) { a.flagged++; if (a.flaggedList.length < ORPHAN_CAP) a.flaggedList.push(item) }
       }
       renderOverview()
     })
@@ -420,7 +309,7 @@ async function loadEvents(signal) {
         const r = await api('/api/UserAccount/UserEvents', { signal, body: { PageNumber: p, RowsInPage: EVENT_PAGE } })
         const list = Array.isArray(r) ? r : ['events', 'items', 'data', 'rows'].map((k) => r?.[k]).find(Array.isArray)
         if (!list) { if (p === 1) ev.skipped = 'The events endpoint returned a format I do not recognise.'; stop = true; return }
-        pagesRows[p] = list; state.lastProgress = Date.now()
+        pagesRows[p] = list
         if (list.length < EVENT_PAGE) stop = true
       } catch (err) {
         if (err.name === 'AbortError') { stop = true; return }
@@ -439,7 +328,6 @@ async function loadEvents(signal) {
 const orphSummary = (a) => ({ linkCounted: a.linkCounted, orphanTotal: a.orphanTotal, sources: a.sources, endpoints: a.endpoints, flagged: a.flagged, combos: [...a.orphanCombos.values()] })
 function typeView(t) {
   const a = state.assets[t]
-  if (a?.done && filterActive()) return filteredView(t)
   if (a && (a.total || a.done)) return { total: a.total, tools: a.tools.size, dbs: a.dbs.size, schemas: a.schemas.size, conns: [...a.conns.values()], combos: [...a.combos.values()], orph: orphSummary(a) }
   return state.cache.catalog?.types?.[t] || null
 }
@@ -451,7 +339,7 @@ function renderKpis() {
   const prev = state.cache.catalog?.prev, finished = !state.loading
   const delta = (ty, cur) => {
     const p = prev?.totals?.[ty]
-    if (!finished || p == null || cur == null || filterActive()) return ['', '']
+    if (!finished || p == null || cur == null) return ['', '']
     const d = cur - p, when = new Date(prev.savedAt).toLocaleDateString()
     return [d === 0 ? `no change since ${when}` : `${d > 0 ? '+' : '−'}${Math.abs(d).toLocaleString()} since ${when}`, d > 0 ? 'up' : d < 0 ? 'down' : '']
   }
@@ -474,7 +362,6 @@ function renderChip() {
   const parts = []
   const cat = state.loadFinishedAt || state.cache.catalog?.savedAt
   if (state.loading) parts.push('refreshing catalog…')
-  else if (state.fromSaved) parts.push(`Catalog saved ${new Date(state.fromSaved).toLocaleString([], { dateStyle: 'short', timeStyle: 'short' })}`)
   else if (cat) parts.push(`Catalog ${new Date(cat).toLocaleString([], { dateStyle: 'short', timeStyle: 'short' })}`)
   const l = state.local?.lineage
   if (l && (l.up || l.down)) parts.push(`lineage saved: ${l.up.toLocaleString()} up · ${l.down.toLocaleString()} down`)
@@ -484,23 +371,19 @@ function setTab(name) {
   state.tab = name
   document.querySelectorAll('.tab').forEach((b) => b.classList.toggle('on', b.dataset.tab === name))
   document.querySelectorAll('.panel').forEach((p) => { p.hidden = p.dataset.panel !== name })
-  $('#typeSeg').style.visibility = ['overview', 'explorer', 'orphans', 'health'].includes(name) ? 'visible' : 'hidden'
+  $('#typeSeg').style.visibility = ['overview', 'orphans'].includes(name) ? 'visible' : 'hidden'
   try { localStorage.setItem('lineage-tab', name) } catch { /* storage unavailable */ }
-  if (name === 'health') renderHealth()
-  if (name === 'explorer') renderExplorer()
-  if (name === 'overview') renderStats()
 }
 document.querySelector('.tabs').addEventListener('click', (e) => { const b = e.target.closest('.tab'); if (b) setTab(b.dataset.tab) })
 $('#dlOpen').addEventListener('click', () => { if (counts()[1] || counts()[2]) showPrompt(); else $('#dlEmpty p').textContent = 'Load the catalog first (use Reload assets and events), then choose what to download.' })
-document.querySelectorAll('input[name=bdtype]').forEach((r) => r.addEventListener('change', () => { renderKpis(); renderStats(); if (state.tab === 'health') renderHealth(); if (state.tab === 'explorer') renderExplorer() }))
+document.querySelectorAll('input[name=bdtype]').forEach((r) => r.addEventListener('change', renderKpis))
 function renderOverview() {
   const n = (v) => (v ?? 0).toLocaleString()
   renderKpis()
   const loading = state.loading
   const live = state.assets[1] || state.assets[2]
   const cachedOnly = !live?.total && state.cache.catalog
-  if (!loading && state.fromSaved) $('#catState').textContent = `from saved files · saved ${new Date(state.fromSaved).toLocaleString()}`
-  else $('#catState').textContent = loading ? (cachedOnly ? `showing saved numbers from ${new Date(state.cache.catalog.savedAt).toLocaleString()}, refreshing…` : 'still fetching…')
+  $('#catState').textContent = loading ? (cachedOnly ? `showing saved numbers from ${new Date(state.cache.catalog.savedAt).toLocaleString()}, refreshing…` : 'still fetching…')
     : state.loadFinishedAt ? `up to date · ${new Date(state.loadFinishedAt).toLocaleTimeString()}` : cachedOnly ? `saved ${new Date(state.cache.catalog.savedAt).toLocaleString()}` : ''
 
   const warns = []
@@ -508,11 +391,6 @@ function renderOverview() {
     const a = state.assets[t]
     if (a?.hitCap) warns.push(`The ${TYPE_NAME[t]} list stopped at the ${MAX_PAGES}-page safety cap, so it may be larger than shown.`)
     else if (a?.done && a.total > 0 && a.total % PAGE === 0) warns.push(`The ${TYPE_NAME[t]} total is an exact multiple of 10,000, so the API may have stopped early. Treat it as a minimum.`)
-  }
-  for (const t of [1, 2]) {
-    const a = state.assets[t]
-    if (a?.fallback) warns.push(`Could not load ${TYPE_NAME[t]} assets from Octopai (${a.fallback}). Showing the saved copy from ${new Date(a.savedAt).toLocaleString()}. Click Reload assets and events to try again.`)
-    else if (a?.error && !a.done && !loading) warns.push(`Could not load ${TYPE_NAME[t]} assets from Octopai: ${a.error}. No saved copy is available yet. Click Reload assets and events to try again.`)
   }
   $('#catWarn').hidden = !warns.length; $('#catWarn').textContent = warns.join(' ')
 
@@ -531,7 +409,6 @@ function renderOverview() {
   renderBreakdown()
   renderStatus()
   renderChip()
-  renderStats()
 }
 $('#moreConns').addEventListener('click', () => { state.showAllConns = !state.showAllConns; renderOverview() })
 
@@ -545,27 +422,14 @@ function renderStatus() {
     time = fmtDur(secs); pct = dl.done / Math.max(dl.total, 1) * 100
   } else if (state.loading) {
     const a1 = state.assets[1], a2 = state.assets[2], ev = state.events
-    const idle = (Date.now() - (state.lastProgress || state.loadStartedAt)) / 1000
-    const part = (a, name) => `${a.total.toLocaleString()} ${name}${a.reading ? ' (reading saved file)' : ''}${a.done ? ' ✓' : a.error ? ' (failed)' : ''}`
-    text = `Loading: ${part(a2, 'column-level')}, ${part(a1, 'cross-system')} assets, ${ev.rows.length.toLocaleString()} events${ev.running ? '' : ' ✓'}…` +
-      (idle > 30 ? ` · waiting on Octopai, no new data for ${fmtDur(idle)} (a request is retried if it takes over ${REQ_TIMEOUT_MS / 60000} min)` : '')
+    text = `Loading: ${a2.total.toLocaleString()} column-level, ${a1.total.toLocaleString()} cross-system assets, ${ev.rows.length.toLocaleString()} events…`
     time = `${Math.round((Date.now() - state.loadStartedAt) / 1000)}s`; pct = null
-  } else if (state.saving) {
-    const sv = state.saving
-    text = sv.compressing ? `Saving ${TYPE_NAME[sv.t]} assets on this computer: compressing… keep this page open` : `Saving ${TYPE_NAME[sv.t]} assets on this computer: ${sv.done.toLocaleString()} of ${sv.total.toLocaleString()}… keep this page open`
-    time = ''; pct = sv.compressing ? null : sv.done / Math.max(sv.total, 1) * 100
   } else if (run && ['finding', 'lineage', 'running'].some((s) => String(run.status).startsWith(s))) {
     text = `Keyword scan: ${run.status === 'lineage' ? `lineage ${run.done.toLocaleString()} of ${run.columns.length.toLocaleString()}` : run.status}`
     time = fmtDur((Date.now() - run.startedAt) / 1000); pct = run.columns.length ? run.done / run.columns.length * 100 : null
   } else if (state.loadFinishedAt) {
     const a1 = state.assets[1], a2 = state.assets[2]
-    const failed = [1, 2].filter((t) => state.assets[t]?.error && !state.assets[t].done).map((t) => TYPE_NAME[t])
-    text = (failed.length ? `Could not load ${failed.join(' or ')} assets (see the message above) · ` : '') + `Loaded ${a2.total.toLocaleString()} column-level and ${a1.total.toLocaleString()} cross-system assets` + (() => {
-      const st = [1, 2].filter((t) => state.assets[t]?.savedAt)
-      if (st.length === 2) return ` from saved files (saved ${new Date(state.fromSaved).toLocaleString()}; use Reload assets and events to refresh)`
-      if (st.length === 1) return ` (${TYPE_NAME[st[0]]} from saved files, saved ${new Date(state.assets[st[0]].savedAt).toLocaleString()})`
-      return ''
-    })() + (state.saveNote ? ` · ${state.saveNote}` : '') + (state.dl ? ` · lineage download ${state.dl.status}` : '')
+    text = `Loaded ${a2.total.toLocaleString()} column-level and ${a1.total.toLocaleString()} cross-system assets` + (state.dl ? ` · lineage download ${state.dl.status}` : '')
     time = `${Math.round((state.loadFinishedAt - state.loadStartedAt) / 1000)}s`; pct = 100
   }
   bar.hidden = !text || $('#appView').hidden
@@ -573,7 +437,7 @@ function renderStatus() {
   $('#catBar').parentElement.classList.toggle('indet', pct === null)
   $('#catBar').style.width = pct === null ? '' : `${Math.round(pct)}%`
 }
-setInterval(() => { if (state.dl?.status === 'running' || state.loading || state.saving || state.run?.status === 'lineage') renderStatus() }, 1000)
+setInterval(() => { if (state.dl?.status === 'running' || state.loading || state.run?.status === 'lineage') renderStatus() }, 1000)
 
 // Breakdown of assets by category (rules in categories.js) with a subtotal per tool.
 let bdChosen = false
@@ -596,7 +460,7 @@ function renderBreakdown() {
   const pct = (n) => (grand ? `${(n / grand * 100).toFixed(1)}%` : '')
   const shown = [...cats.values()].filter((c) => c.id !== 'other' || c.total)
   const stack = `<div class="stack" role="img" aria-label="Share of assets by category">${shown.filter((c) => c.total).map((c) => `<i style="width:${c.total / grand * 100}%;background:var(--c-${c.id})" title="${esc(c.name)}: ${c.total.toLocaleString()} (${pct(c.total)})"></i>`).join('')}</div><div class="legend">${shown.filter((c) => c.total).map((c) => `<span style="--c:var(--c-${c.id})">${esc(c.name)} ${pct(c.total)}</span>`).join('')}</div>`
-  el.innerHTML = filterNote() + stack + shown.map((c) => {
+  el.innerHTML = stack + shown.map((c) => {
     const rows = [...c.tools.values()].sort((a, b) => b.count - a.count)
       .map((x) => `<div class="toolrow"><span>${esc(x.name)}</span><span class="badge">${esc(x.type)}</span><span class="ct">${x.count.toLocaleString()}</span><span class="pct">${pct(x.count)}</span></div>`).join('')
     return `<details class="cat" style="--c:var(--c-${c.id})" ${c.total && c.total / grand > 0.02 ? 'open' : ''}><summary><span>${esc(c.name)}</span><span class="ct">${c.total.toLocaleString()}</span><span class="pct">${pct(c.total)}</span></summary>${rows || '<div class="toolrow muted"><span>No assets</span></div>'}</details>`
@@ -626,7 +490,7 @@ function renderOrphans() {
   const v = typeView(t), a = state.assets[t], f = state.findings
   if (!v) { el.innerHTML = '<p class="muted small">Waiting for assets…</p>'; return }
   const o = v.orph
-  let html = filterNote()
+  let html = ''
   if (o && o.linkCounted) {
     const pct = v.total ? (o.orphanTotal / v.total * 100).toFixed(1) : '0.0'
     html += `<div class="pairs"><span><b>${nf(o.orphanTotal)}</b> orphans with no connections (${pct}% of ${TYPE_NAME[t]} assets)</span><span>${nf(o.sources)} sources (outputs only)</span><span>${nf(o.endpoints)} end points (inputs only)</span></div>`
@@ -640,7 +504,7 @@ function renderOrphans() {
     } else html = '<div class="verdict fine">No orphans: every asset has at least one connection.</div>' + html
     html += `<h4>Orphan rate by category</h4><div class="hbars">${cats.map((c) => { const tot = allCats.get(c.id)?.total || 0, r = tot ? c.total / tot * 100 : 0; return `<div class="hbar"><span>${esc(c.name)}</span><span class="tr"><i style="width:${Math.min(100, r)}%;--c:var(--c-${c.id})"></i></span><span class="v">${nf(c.total)} of ${nf(tot)} · ${r.toFixed(1)}%</span></div>` }).join('')}</div>`
     html += cats.map((c) => `<details class="cat" style="--c:var(--c-${c.id})"><summary><span>${esc(c.name)}</span><span class="ct">${nf(c.total)}</span><span class="pct">${o.orphanTotal ? (c.total / o.orphanTotal * 100).toFixed(1) + '%' : ''}</span></summary>${[...c.tools.values()].sort((x, y) => y.count - x.count).map((x) => `<div class="toolrow"><span>${esc(x.name)}</span><span class="badge">${esc(x.type)}</span><span class="ct">${nf(x.count)}</span><span class="pct"></span></div>`).join('')}</details>`).join('')
-    const list = v.orphans || a?.orphans || []
+    const list = a?.orphans || []
     if (list.length) {
       html += `<div class="scroll"><table class="ev"><tr><th>Orphan asset</th><th>Connection</th><th>Tool</th></tr>${list.slice(0, orphUi.show).map((x) => `<tr><td title="${esc(x.l)}">${esc(x.l)}</td><td>${esc(x.c)}</td><td>${esc(x.tool)}</td></tr>`).join('')}</table></div>`
       html += `<div class="muted small">Showing ${Math.min(orphUi.show, list.length).toLocaleString()} of ${nf(o.orphanTotal)}${list.length < o.orphanTotal ? ` (the list holds the first ${nf(list.length)})` : ''}. ${list.length > orphUi.show ? '<button class="linkbtn" id="orphMore" type="button">Show 50 more</button> ' : ''}<button class="linkbtn" id="orphCsv" type="button">Download orphans as CSV</button></div>`
@@ -668,7 +532,7 @@ $('#orph').addEventListener('click', (e) => {
   if (e.target.id === 'orphMore') { orphUi.show += 50; renderOrphans(); return }
   if (e.target.id === 'orphCsv') {
     const t = Number(document.querySelector('input[name=bdtype]:checked').value)
-    const rows = (typeView(t)?.orphans || state.assets[t]?.orphans || []).map((x) => [t, x.k, x.l, x.c, x.tool, x.tt, x.ot, CATEGORY_ORDER.find((c) => c.id === classify({ tool: x.tool, toolType: x.tt, objectType: x.ot, container: x.ct }))?.name])
+    const rows = (state.assets[t]?.orphans || []).map((x) => [t, x.k, x.l, x.c, x.tool, x.tt, x.ot, CATEGORY_ORDER.find((c) => c.id === classify({ tool: x.tool, toolType: x.tt, objectType: x.ot, container: x.ct }))?.name])
     downloadBlob(new Blob(['﻿' + [['asset_type', 'key', 'asset', 'connection', 'tool', 'tool_type', 'object_type', 'category'], ...rows].map((r) => r.map(csvCell).join(',')).join('\r\n')], { type: 'text/csv;charset=utf-8' }), `orphans-${state.tenant}-${TYPE_NAME[t]}-${new Date().toISOString().slice(0, 10)}.csv`)
   }
   if (e.target.id === 'findCsv') {
@@ -784,12 +648,12 @@ $('#evBody').addEventListener('click', (e) => {
 $('#evBody').addEventListener('change', (e) => { if (e.target.id === 'evUser') { evFilter.user = e.target.value; evFilter.show = 25; renderEvents() } })
 
 // ---------- Stage 3: ask before downloading lineage ----------
-function counts() { return { 1: activeItems(1).length, 2: activeItems(2).length } }
+function counts() { return { 1: state.assets[1]?.items.length || 0, 2: state.assets[2]?.items.length || 0 } }
 function showPrompt() {
   const c = counts()
   $('#lineagePrompt').hidden = false; $('#dlReopen').hidden = true; $('#dlEmpty p').textContent = 'Download the lineage graphs for your assets to find confirmed orphans and broken links. Results are saved on this computer and also feed the local keyword scan.'
   const ev = state.events
-  $('#promptSummary').textContent = (filterActive() ? 'The source filter is on, so only assets from the selected sources are counted. ' : '') + `Assets are loaded (${c[2].toLocaleString()} column-level, ${c[1].toLocaleString()} cross-system)` + (ev?.done ? ` and ${ev.rows.length.toLocaleString()} user events.` : ev?.skipped ? '. User events were skipped.' : '.') + ' Do you want to start downloading lineage for them now?'
+  $('#promptSummary').textContent = `Assets are loaded (${c[2].toLocaleString()} column-level, ${c[1].toLocaleString()} cross-system)` + (ev?.done ? ` and ${ev.rows.length.toLocaleString()} user events.` : ev?.skipped ? '. User events were skipped.' : '.') + ' Do you want to start downloading lineage for them now?'
   $('#optT2Label').textContent = `Column-level (${c[2].toLocaleString()} assets)`
   $('#optT1Label').textContent = `Cross-system (${c[1].toLocaleString()} assets)`
   // Pre-select the smaller non-empty set so the default is the cheaper download.
@@ -810,10 +674,10 @@ function updateEstimate() {
   const s = selection()
   $('#dlStart').disabled = !s.calls
   $('#promptEstimate').textContent = s.calls
-    ? `This makes about ${s.calls.toLocaleString()} requests (one per asset per direction), 6 at a time, and writes the results to a file as it goes.${s.calls > 5000 ? ' That is a lot, so it may take a long time. Keep this tab open. If the token expires you will be asked for your password to continue.' : ''}`
+    ? `This makes about ${s.calls.toLocaleString()} requests (one per asset per direction)${$('#optSkip').checked ? ', fewer if some already have saved lineage' : ''}, 6 at a time, and writes the results to a file as it goes.${s.calls > 5000 ? ' That is a lot, so it may take a long time. Keep this tab open. If the token expires you will be asked for your password to continue.' : ''}`
     : 'Choose at least one set of assets and one direction.'
 }
-document.querySelectorAll('#optT1,#optT2,#optUp,#optDown,#optLimit').forEach((el) => el.addEventListener('input', updateEstimate))
+document.querySelectorAll('#optT1,#optT2,#optUp,#optDown,#optLimit,#optSkip,#optAge').forEach((el) => el.addEventListener('input', updateEstimate))
 $('#dlLater').addEventListener('click', () => { $('#lineagePrompt').hidden = true; $('#dlReopen').hidden = false })
 $('#dlReopen').addEventListener('click', () => setTab('download'))
 $('#dlReopen').addEventListener('click', () => { if (!state.dl || state.dl.status !== 'running') showPrompt() })
@@ -824,9 +688,25 @@ $('#dlStart').addEventListener('click', startDownload)
 async function startDownload() {
   const s = selection(); if (!s.calls) return
   const jobs = []
-  for (const t of s.types) for (const it of activeItems(t).slice(0, s.per[t])) for (const d of s.dirs) jobs.push([t, it, d])
+  const skipOn = $('#optSkip').checked, maxAgeMs = Number($('#optAge').value) * 86400000
+  let skipped = 0
+  const have = {}
+  if (skipOn) {
+    $('#dlStart').disabled = true; $('#promptEstimate').textContent = 'Checking what is already saved…'
+    try {
+      for (const t of s.types) for (const d of s.dirs) { const r = await fetch(`/local/${state.tenant}/have?type=${t}&dir=${DIR_NAME[d]}`); have[`${t}|${d}`] = r.ok ? (await r.json()).have : {} }
+    } catch { /* fall back to downloading everything */ }
+    $('#dlStart').disabled = false
+  }
+  const isFresh = (t, d, k) => { const at = have[`${t}|${d}`]?.[k]; return !!at && (!maxAgeMs || Date.now() - at < maxAgeMs) }
+  for (const t of s.types) {
+    const items = state.assets[t].items
+    const todo = skipOn ? items.filter((it) => s.dirs.some((d) => !isFresh(t, d, it.k))) : items
+    for (const it of todo.slice(0, s.limit ? s.limit : todo.length)) for (const d of s.dirs) { if (skipOn && isFresh(t, d, it.k)) skipped++; else jobs.push([t, it, d]) }
+  }
+  if (!jobs.length) { $('#promptEstimate').textContent = 'Everything selected already has saved lineage, so there is nothing to download. Untick "Skip assets that already have saved lineage" to download again.'; return }
   const runId = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19)
-  const dl = state.dl = { runId, total: jobs.length, done: 0, errors: 0, truncated: 0, nodes: 0, startedAt: Date.now(), abort: new AbortController(), status: 'running', buf: [], flushing: Promise.resolve(), note: '', dirs: s.dirs, seen: new Map(), keySets: {} }
+  const dl = state.dl = { runId, total: jobs.length, done: 0, errors: 0, truncated: 0, nodes: 0, startedAt: Date.now(), abort: new AbortController(), status: 'running', buf: [], flushing: Promise.resolve(), note: '', dirs: s.dirs, seen: new Map(), keySets: {}, skipped }
   for (const t of s.types) dl.keySets[t] = new Set(state.assets[t].items.map((x) => x.k))
   state.findings = newFindings(); lastFindSig = ''; renderOrphans()
   $('#lineagePrompt').hidden = true; $('#dlCard').hidden = false; $('#dlJson').hidden = true; $('#dlCsv').hidden = true
@@ -860,7 +740,6 @@ async function startDownload() {
   clearInterval(timer); flush(true); await dl.flushing
   dl.status = dl.done >= dl.total ? 'complete' : 'stopped'; dl.finishedAt = Date.now()
   $('#catalogBtn').disabled = false; $('#dlCancel').hidden = true; $('#dlReopen').hidden = false; refreshLocalStatus()
-  coverage.data = {}; renderStats(); if (state.tab === 'health') renderHealth()
   if (dl.done) { $('#dlJson').href = `/export/${state.tenant}/${runId}`; $('#dlCsv').href = `/export/${state.tenant}/${runId}?format=csv`; $('#dlJson').hidden = false; $('#dlCsv').hidden = false }
   renderDl()
 }
@@ -872,7 +751,7 @@ function renderDl() {
   $('#dlState').textContent = dl.status === 'running' ? 'running' : dl.status === 'complete' ? 'complete' : 'stopped early. Partial results are saved.'
   $('#dlStats').textContent = `${dl.done.toLocaleString()} of ${dl.total.toLocaleString()} graphs · ${dl.nodes.toLocaleString()} related assets · ${rate.toFixed(1)} per second` + (dl.status === 'running' && dl.done > 20 ? ` · about ${fmtDur(left)} left` : '') + (dl.errors ? ` · ${dl.errors} failed` : '') + (dl.truncated ? ` · ${dl.truncated} possibly incomplete (hit the node limit)` : '')
   renderStatus(); refreshOrphans()
-  $('#dlNote').textContent = dl.note || (dl.status === 'complete' ? `Saved on this computer in the data/exports/${state.tenant} folder as ${dl.runId}.ndjson.` : '')
+  $('#dlNote').textContent = dl.note || (dl.status === 'complete' ? `Saved on this computer in the data/exports/${state.tenant} folder as ${dl.runId}.ndjson.` : '') + (dl.skipped ? ` ${dl.skipped.toLocaleString()} requests were skipped because lineage was already saved. Orphan and broken-lineage findings below cover only what was downloaded in this run.` : '')
 }
 
 // ---------- Lineage for one asset ----------
@@ -970,31 +849,11 @@ async function startScan() {
 // Searches the asset list saved on this computer, then reads lineage from the saved scan cache and the lineage downloads.
 // Nothing is sent to Octopai.
 const jpost = async (url, body) => { const r = await fetch(url, { method: 'POST', body: JSON.stringify(body) }); if (!r.ok) throw new Error(`Local read failed (${r.status})`); return r.json() }
-// Saves the asset list in chunks (compact rows plus a dictionary of repeated strings), so even millions of assets save
-// without building one huge string. The server compresses it and swaps it in only when every chunk has arrived.
-const SAVE_CHUNK = 50000
-async function saveAssetsLocal(types = [1, 2]) {
-  for (const t of types) {
-    const a = state.assets[t]; if (!a?.done || a.error || a.savedAt) continue
-    const items = a.items
-    state.saving = { t, done: 0, total: items.length }; renderStatus()
-    const post = async (op, body) => { const r = await fetch(`/assets/${state.tenant}/${t}?op=${op}`, { method: 'POST', body }); if (!r.ok) throw new Error(`save ${op} failed (${r.status})`) }
-    try {
-      const dict = new Map()
-      const di = (v) => { v = v ?? ''; let i = dict.get(v); if (i === undefined) { i = dict.size; dict.set(v, i) } return i }
-      for (const x of items) { di(x.c); di(x.tool); di(x.tt); di(x.ot); di(x.ct); di(x.d); di(x.s); di(x.tb) }
-      await post('begin', JSON.stringify({ meta: { savedAt: Date.now(), count: items.length, v: 3 } }) + '\n' + JSON.stringify({ dict: [...dict.keys()] }) + '\n')
-      for (let i = 0; i < items.length; i += SAVE_CHUNK) {
-        const body = items.slice(i, i + SAVE_CHUNK).map((x) => JSON.stringify([x.k, x.n, di(x.c), di(x.tool), di(x.tt), di(x.ot), di(x.ct), di(x.d), di(x.s), di(x.tb), x.ins ?? null, x.outs ?? null, x.fo ? 1 : 0])).join('\n') + '\n'
-        await post('append', body)
-        state.saving.done = Math.min(i + SAVE_CHUNK, items.length); renderStatus()
-      }
-      state.saving.compressing = true; renderStatus()
-      await post('commit', '')
-      state.saveNote = `Saved ${items.length.toLocaleString()} ${TYPE_NAME[t]} assets on this computer.`
-    } catch (err) {
-      state.saveNote = `Could not save the ${TYPE_NAME[t]} assets on this computer (${err.message}), so they will be downloaded again next time.`
-    } finally { state.saving = null; renderStatus() }
+async function saveAssetsLocal() {
+  for (const t of [1, 2]) {
+    const a = state.assets[t]; if (!a?.done || !a.items.length) continue
+    const body = a.items.map((i) => JSON.stringify({ k: i.k, l: i.l, n: i.n, c: i.c, tool: i.tool, tt: i.tt, ot: i.ot, ct: i.ct, ins: i.ins, outs: i.outs })).join('\n')
+    try { await fetch(`/assets/${state.tenant}/${t}`, { method: 'PUT', body }) } catch { /* local save is best effort */ }
   }
   refreshLocalStatus()
 }
@@ -1168,518 +1027,3 @@ $('#chips').addEventListener('click', (e) => {
   if (!cur.includes(k)) cur.push(k)
   $('#keywords').value = cur.join(', ')
 })
-
-// ---------- Source filter (like the metadata source picker in Octopai's lineage dashboard) ----------
-// Unchecked connections are left out of the KPIs, Overview, Orphans & Health, Catalog Health and the lineage download.
-const srcFilter = { off: new Set() }
-const fvMemo = new Map(), itemsMemo = new Map()
-const filterKey = () => `lineage-srcoff-${state.tenant}`
-function loadFilter() { try { return new Set(JSON.parse(localStorage.getItem(filterKey()) || '[]')) } catch { return new Set() } }
-function saveFilter() { try { localStorage.setItem(filterKey(), JSON.stringify([...srcFilter.off])) } catch { /* storage unavailable */ } }
-const normType = (tt) => { const u = String(tt || '').toUpperCase(); return u === 'DATABASE' ? 'DB' : u || 'OTHER' }
-const filterSig = () => [...srcFilter.off].sort().join('\u0001')
-const filterActive = () => srcFilter.off.size > 0 && !!(state.assets[1]?.done || state.assets[2]?.done)
-function allSources() {
-  const m = new Map()
-  for (const t of [1, 2]) for (const c of state.assets[t]?.conns?.values() || []) {
-    const s = m.get(c.name) || { name: c.name, tool: c.tool, tt: normType(c.tt), count: 0 }
-    s.count += c.count; m.set(c.name, s)
-  }
-  return [...m.values()]
-}
-function activeItems(t) {
-  const a = state.assets[t]; if (!a) return []
-  if (!filterActive()) return a.items
-  const key = `${filterSig()}|${a.items.length}`, hit = itemsMemo.get(t)
-  if (hit?.key === key) return hit.items
-  const items = a.items.filter((x) => !srcFilter.off.has(x.c))
-  itemsMemo.set(t, { key, items })
-  return items
-}
-function filteredView(t) {
-  const a = state.assets[t], key = `${filterSig()}|${a.items.length}`, hit = fvMemo.get(t)
-  if (hit?.key === key) return hit.v
-  const tools = new Set(), dbs = new Set(), schemas = new Set(), conns = new Map(), combos = new Map(), oc = new Map(), orphans = []
-  const orph = { linkCounted: 0, orphanTotal: 0, sources: 0, endpoints: 0, flagged: 0, combos: [] }
-  const items = activeItems(t)
-  for (const x of items) {
-    if (x.tool) tools.add(x.tool)
-    if (x.d) dbs.add(x.d)
-    if (x.d || x.s) schemas.add(`${x.d}.${x.s}`)
-    const c = conns.get(x.c) || { name: x.c, tool: x.tool, tt: x.tt, count: 0 }
-    c.count++; conns.set(x.c, c)
-    const ck = [x.tool, x.tt, x.ot, x.ct].join('\u0001')
-    const cb = combos.get(ck) || { tool: x.tool, toolType: x.tt, objectType: x.ot, container: x.ct, count: 0 }
-    cb.count++; combos.set(ck, cb)
-    if (x.ins != null && x.outs != null) {
-      orph.linkCounted++
-      if (x.ins === 0 && x.outs === 0) {
-        orph.orphanTotal++; if (orphans.length < ORPHAN_CAP) orphans.push(x)
-        const o = oc.get(ck) || { tool: x.tool, toolType: x.tt, objectType: x.ot, container: x.ct, count: 0 }
-        o.count++; oc.set(ck, o)
-      } else if (x.ins === 0) orph.sources++
-      else if (x.outs === 0) orph.endpoints++
-    }
-    if (x.fo) orph.flagged++
-  }
-  orph.combos = [...oc.values()]
-  const v = { total: items.length, tools: tools.size, dbs: dbs.size, schemas: schemas.size, conns: [...conns.values()], combos: [...combos.values()], orph, orphans }
-  fvMemo.set(t, { key, v })
-  return v
-}
-function filterNote() {
-  if (!filterActive()) return ''
-  const all = allSources(), on = all.filter((s) => !srcFilter.off.has(s.name)).length
-  return `<p class="warnbox small">Source filter is on: showing ${on} of ${all.length} sources. <button class="linkbtn" type="button" data-clearfilter>Show all sources</button></p>`
-}
-const TYPE_ORDER = ['ETL', 'DB', 'REPORT']
-function buildSources() {
-  const all = allSources(), btn = $('#srcBtn'), panel = $('#srcPanel')
-  btn.disabled = !all.length
-  btn.title = all.length ? '' : 'Load assets first'
-  const on = all.filter((s) => !srcFilter.off.has(s.name)).length
-  btn.textContent = !all.length ? 'Sources' : on === all.length ? `Sources: all ${all.length}` : `Sources: ${on} of ${all.length}`
-  btn.classList.toggle('on', on < all.length && all.length > 0)
-  const groups = new Map()
-  for (const s of all) { if (!groups.has(s.tt)) groups.set(s.tt, []); groups.get(s.tt).push(s) }
-  const order = [...groups.keys()].sort((a, b) => ((TYPE_ORDER.indexOf(a) + 1) || 99) - ((TYPE_ORDER.indexOf(b) + 1) || 99) || a.localeCompare(b))
-  panel.innerHTML = `<div class="srctop"><span class="muted small">Metadata sources</span><span><button class="linkbtn" type="button" data-srcall>Check all</button> · <button class="linkbtn" type="button" data-srcnone>Uncheck all</button></span></div>` +
-    order.map((g) => {
-      const list = groups.get(g).sort((a, b) => b.count - a.count), n = list.filter((s) => !srcFilter.off.has(s.name)).length
-      return `<div class="srcgroup"><label class="check srchead"><input type="checkbox" data-srcgroup="${esc(g)}"${n === list.length ? ' checked' : ''}${n && n < list.length ? ' data-mixed="1"' : ''}> <b>${esc(g)}</b><span class="muted small">${n} / ${list.length}</span></label>` +
-        list.map((s) => `<label class="check srcrow2"><input type="checkbox" data-src="${esc(s.name)}"${srcFilter.off.has(s.name) ? '' : ' checked'}> <span class="nm">${esc(s.name || '(unnamed)')}</span><span class="badge">${esc(s.tool)}</span><span class="ct muted small">${s.count.toLocaleString()}</span></label>`).join('') + '</div>'
-    }).join('')
-  panel.querySelectorAll('[data-mixed]').forEach((el) => { el.indeterminate = true })
-}
-function onFilterChange() {
-  saveFilter(); fvMemo.clear(); itemsMemo.clear(); healthMemo.clear(); xMemo.clear(); statsMemo.clear()
-  buildSources(); renderOverview()
-  if (state.tab === 'health') renderHealth()
-  if (state.tab === 'explorer') renderExplorer()
-  if (!$('#lineagePrompt').hidden) showPrompt()
-}
-$('#srcBtn').addEventListener('click', (e) => {
-  e.stopPropagation()
-  const p = $('#srcPanel'); p.hidden = !p.hidden
-  if (!p.hidden) p.classList.toggle('left', $('#srcBtn').getBoundingClientRect().right < Math.min(440, window.innerWidth - 16))
-})
-document.addEventListener('click', (e) => {
-  if (e.target.closest('[data-clearfilter]')) { srcFilter.off.clear(); onFilterChange(); return }
-  if (!$('#srcPanel').hidden && !e.target.closest('.srcpick')) $('#srcPanel').hidden = true
-})
-$('#srcPanel').addEventListener('click', (e) => {
-  if (e.target.closest('[data-srcall]')) { srcFilter.off.clear(); onFilterChange() }
-  else if (e.target.closest('[data-srcnone]')) { for (const s of allSources()) srcFilter.off.add(s.name); onFilterChange() }
-})
-$('#srcPanel').addEventListener('change', (e) => {
-  const el = e.target
-  if (el.dataset.src !== undefined) { el.checked ? srcFilter.off.delete(el.dataset.src) : srcFilter.off.add(el.dataset.src) }
-  else if (el.dataset.srcgroup !== undefined) { for (const s of allSources()) if (s.tt === el.dataset.srcgroup) el.checked ? srcFilter.off.delete(s.name) : srcFilter.off.add(s.name) }
-  else return
-  onFilterChange()
-})
-
-// ---------- Catalog Health: schemas, cleanup candidates, same name in several schemas, report coverage ----------
-const healthMemo = new Map()
-const healthUi = { schemas: 15, cleanup: 25, rule: '', dupes: 25, cov: 25 }
-const coverage = { data: {}, loading: {} }
-const schemaOf = (x) => [x.d, x.s].filter(Boolean).join('.') || '(no schema)'
-const catOf = (x) => classify({ tool: x.tool, toolType: x.tt, objectType: x.ot, container: x.ct })
-const isOrphan = (x) => x.ins === 0 && x.outs === 0
-const hasLinks = (x) => x.ins != null && x.outs != null
-const pctTxt = (n, d) => (d ? `${(n / d * 100).toFixed(1)}%` : '–')
-function csvDownload(head, rows, name) {
-  downloadBlob(new Blob(['﻿' + [head, ...rows].map((r) => r.map(csvCell).join(',')).join('\r\n')], { type: 'text/csv;charset=utf-8' }), `${name}-${state.tenant}-${new Date().toISOString().slice(0, 10)}.csv`)
-}
-// One entry per object (table, view, package...). Column-level assets are rolled up to their table.
-function objectsFor(t) {
-  const items = activeItems(t), key = `obj|${t}|${filterSig()}|${items.length}`
-  if (healthMemo.has(key)) return healthMemo.get(key)
-  let out
-  if (t === 1) {
-    out = items.map((x) => {
-      const name = x.n || x.tb
-      return { name, path: [x.d, x.s, x.tb && x.tb !== name ? x.tb : '', name].filter(Boolean).join('.'), schema: schemaOf(x), type: x.ot || x.ct, conn: x.c, tool: x.tool, cat: catOf(x), cols: 1, linked: hasLinks(x) ? 1 : 0, orphans: isOrphan(x) ? 1 : 0, keys: [x.k] }
-    })
-  } else {
-    const m = new Map()
-    for (const x of items) {
-      if (!x.tb) continue
-      const k = `${x.c}\u0001${x.d}\u0001${x.s}\u0001${x.tb}`
-      let o = m.get(k)
-      if (!o) { o = { name: x.tb, path: [x.d, x.s, x.tb].filter(Boolean).join('.'), schema: schemaOf(x), type: x.ct || 'TABLE', conn: x.c, tool: x.tool, cat: catOf(x), cols: 0, linked: 0, orphans: 0, keys: [] }; m.set(k, o) }
-      o.cols++; if (hasLinks(x)) o.linked++; if (isOrphan(x)) o.orphans++; o.keys.push(x.k)
-    }
-    out = [...m.values()]
-  }
-  for (const o of out) { const r = CLEANUP_RULES.find((rule) => rule.test.test(o.name)); o.rule = r?.id || '' }
-  healthMemo.set(key, out)
-  return out
-}
-const lineageTxt = (o) => (!o.linked ? 'unknown' : o.orphans === o.cols ? 'no links' : 'has links')
-
-function waitMsg(t) {
-  const a = state.assets[t]
-  if (a?.running) return `<p class="muted small">Still loading ${TYPE_NAME[t]} assets (${a.total.toLocaleString()} so far)…</p>`
-  if (a?.error) return `<p class="error small">Could not load ${TYPE_NAME[t]} assets from Octopai: ${esc(a.error)}</p><p class="muted small">Click <b>Reload assets and events</b> to try again${state.assets[t === 1 ? 2 : 1]?.done ? `, or switch to ${TYPE_NAME[t === 1 ? 2 : 1]} at the top right` : ''}.</p>`
-  return '<p class="muted small">Waiting for assets. Use Reload assets and events if nothing is loading.</p>'
-}
-function renderHealth() {
-  if (state.tab !== 'health') return
-  const t = selType(), a = state.assets[t]
-  if (!a?.done) { for (const id of ['#hSchemas', '#hCleanup', '#hDupes', '#hCov']) $(id).innerHTML = waitMsg(t); $('#hNote').innerHTML = ''; return }
-  $('#hNote').innerHTML = filterNote() + `<p class="muted small">Checking ${TYPE_NAME[t]} assets${t === 2 ? ', rolled up to their tables' : ''}. Switch the asset type at the top right.</p>`
-  renderSchemas(t); renderCleanup(t); renderDupes(t); renderCoverage(t)
-}
-
-// #3 Breakdown by schema
-function schemaRows(t) {
-  const m = new Map()
-  for (const x of activeItems(t)) {
-    const s = schemaOf(x)
-    const r = m.get(s) || { schema: s, assets: 0, linked: 0, orphans: 0, cleanup: 0, tools: new Set(), conns: new Set() }
-    r.assets++; if (hasLinks(x)) r.linked++; if (isOrphan(x)) r.orphans++
-    if (x.tool) r.tools.add(x.tool); if (x.c) r.conns.add(x.c)
-    m.set(s, r)
-  }
-  for (const o of objectsFor(t)) if (o.rule) { const r = m.get(o.schema); if (r) r.cleanup++ }
-  return [...m.values()].sort((a, b) => b.assets - a.assets)
-}
-function renderSchemas(t) {
-  const rows = schemaRows(t), el = $('#hSchemas')
-  if (!rows.length) { el.innerHTML = '<p class="muted small">No assets for the selected sources.</p>'; return }
-  const max = rows[0].assets, total = rows.reduce((s, r) => s + r.assets, 0)
-  const worst = rows.filter((r) => r.linked >= 20).sort((a, b) => b.orphans / b.linked - a.orphans / a.linked)[0]
-  let html = `<div class="pairs"><span><b>${rows.length.toLocaleString()}</b> schemas</span><span><b>${total.toLocaleString()}</b> assets</span>${worst && worst.orphans ? `<span>Highest orphan rate: <b>${esc(worst.schema)}</b> (${pctTxt(worst.orphans, worst.linked)})</span>` : ''}</div>`
-  html += `<div class="scroll"><table class="ev htable"><tr><th>Schema</th><th class="rt">Assets</th><th></th><th class="rt">Orphans</th><th class="rt">Cleanup candidates</th><th>Tools</th></tr>` +
-    rows.slice(0, healthUi.schemas).map((r) => `<tr><td title="${esc(r.schema)}">${esc(r.schema)}</td><td class="rt">${r.assets.toLocaleString()}</td><td class="barcell"><i style="width:${Math.max(1, Math.round(r.assets / max * 100))}%"></i></td><td class="rt${r.orphans ? ' bad' : ''}">${r.linked ? `${r.orphans.toLocaleString()} <span class="muted">(${pctTxt(r.orphans, r.linked)})</span>` : '<span class="muted">n/a</span>'}</td><td class="rt${r.cleanup ? ' warn' : ''}">${r.cleanup.toLocaleString()}</td><td title="${esc([...r.tools].join(', '))}">${esc([...r.tools].join(', '))}</td></tr>`).join('') + '</table></div>'
-  html += `<div class="muted small">Showing ${Math.min(healthUi.schemas, rows.length)} of ${rows.length}. ${rows.length > healthUi.schemas ? '<button class="linkbtn" type="button" data-more="schemas">Show all</button> ' : ''}<button class="linkbtn" type="button" data-csv="schemas">Download schemas as CSV</button></div>`
-  el.innerHTML = html
-}
-
-// #4 Cleanup candidates
-function renderCleanup(t) {
-  const el = $('#hCleanup'), objs = objectsFor(t).filter((o) => o.rule)
-  if (!objs.length) { el.innerHTML = '<div class="verdict fine">No recycle-bin, backup, test or dated objects found.</div><p class="muted small">The rules are in <code>health-rules.js</code>.</p>'; return }
-  const byRule = new Map(CLEANUP_RULES.map((r) => [r.id, 0])); for (const o of objs) byRule.set(o.rule, byRule.get(o.rule) + 1)
-  const noLinks = objs.filter((o) => lineageTxt(o) === 'no links').length
-  const unit = t === 2 ? 'tables' : 'objects'
-  let html = `<div class="verdict"><b>${objs.length.toLocaleString()}</b> ${unit} look like cleanup candidates.${noLinks ? ` <b>${noLinks.toLocaleString()}</b> of them have no lineage links, so start with those.` : ''}</div>`
-  html += `<div class="chips">${CLEANUP_RULES.filter((r) => byRule.get(r.id)).map((r) => `<button type="button" class="chip${healthUi.rule === r.id ? ' on' : ''}" data-rule="${r.id}" title="${esc(r.help)}">${esc(r.name)} (${byRule.get(r.id).toLocaleString()})</button>`).join('')}</div>`
-  const list = objs.filter((o) => !healthUi.rule || o.rule === healthUi.rule).sort((a, b) => (lineageTxt(a) === 'no links' ? 0 : 1) - (lineageTxt(b) === 'no links' ? 0 : 1) || a.path.localeCompare(b.path))
-  const ruleName = (id) => CLEANUP_RULES.find((r) => r.id === id)?.name || id
-  if (healthUi.rule) html += `<p class="muted small">${esc(CLEANUP_RULES.find((r) => r.id === healthUi.rule)?.help || '')}</p>`
-  html += `<div class="scroll"><table class="ev htable"><tr><th>Object</th><th>Reason</th><th>Type</th><th>Connection</th><th>Lineage</th></tr>` +
-    list.slice(0, healthUi.cleanup).map((o) => `<tr><td title="${esc(o.path)}">${esc(o.path)}</td><td>${esc(ruleName(o.rule))}</td><td>${esc(o.type)}</td><td>${esc(o.conn)}</td><td class="${lineageTxt(o) === 'no links' ? 'good' : lineageTxt(o) === 'has links' ? 'warn' : 'muted'}">${lineageTxt(o)}</td></tr>`).join('') + '</table></div>'
-  html += `<div class="muted small">Showing ${Math.min(healthUi.cleanup, list.length).toLocaleString()} of ${list.length.toLocaleString()}. "Has links" means something still reads from or writes to it, so check before dropping. ${list.length > healthUi.cleanup ? '<button class="linkbtn" type="button" data-more="cleanup">Show 50 more</button> ' : ''}<button class="linkbtn" type="button" data-csv="cleanup">Download cleanup candidates as CSV</button></div>`
-  el.innerHTML = html
-}
-
-// #5 Same name in several schemas
-function dupeGroups(t) {
-  const key = `dupes|${t}|${filterSig()}|${activeItems(t).length}`
-  if (healthMemo.has(key)) return healthMemo.get(key)
-  const m = new Map()
-  for (const o of objectsFor(t)) {
-    if (!o.name || o.name.length < SAME_NAME_MIN_LENGTH || o.rule === 'recycle' || SAME_NAME_IGNORE_TYPES.test(o.type || '')) continue
-    const k = o.name.toUpperCase()
-    if (!m.has(k)) m.set(k, new Map())
-    const bySchema = m.get(k)
-    if (!bySchema.has(o.schema)) bySchema.set(o.schema, o)
-  }
-  const out = [...m].filter(([, s]) => s.size > 1).map(([name, s]) => ({ name, objs: [...s.values()], types: [...new Set([...s.values()].map((o) => o.type).filter(Boolean))] }))
-    .sort((a, b) => b.objs.length - a.objs.length || a.name.localeCompare(b.name))
-  healthMemo.set(key, out)
-  return out
-}
-function renderDupes(t) {
-  const el = $('#hDupes'), groups = dupeGroups(t)
-  if (!groups.length) { el.innerHTML = '<div class="verdict fine">No object name appears in more than one schema.</div>'; return }
-  const copies = groups.reduce((s, g) => s + g.objs.length, 0)
-  let html = `<div class="verdict"><b>${groups.length.toLocaleString()}</b> ${groups.length === 1 ? 'name appears' : 'names appear'} in more than one schema (${copies.toLocaleString()} copies in all). Copies can drift apart, so check that each one is still needed and still the same.</div>`
-  html += `<div class="scroll"><table class="ev htable"><tr><th>Name</th><th>Type</th><th class="rt">Schemas</th><th>Where</th></tr>` +
-    groups.slice(0, healthUi.dupes).map((g) => `<tr><td title="${esc(g.name)}">${esc(g.name)}</td><td>${esc(g.types.join(', '))}</td><td class="rt">${g.objs.length}</td><td title="${esc(g.objs.map((o) => o.schema).join(', '))}">${esc(g.objs.map((o) => o.schema).join(', '))}</td></tr>`).join('') + '</table></div>'
-  html += `<div class="muted small">Showing ${Math.min(healthUi.dupes, groups.length).toLocaleString()} of ${groups.length.toLocaleString()}. ${groups.length > healthUi.dupes ? '<button class="linkbtn" type="button" data-more="dupes">Show 50 more</button> ' : ''}<button class="linkbtn" type="button" data-csv="dupes">Download as CSV</button></div>`
-  el.innerHTML = html
-}
-
-// #6 Report coverage: which DB objects feed at least one report, based on downloaded downstream lineage.
-async function loadCoverage(t) {
-  if (coverage.data[t] || coverage.loading[t]) return
-  coverage.loading[t] = true
-  try {
-    const r = await fetch(`/local/${state.tenant}/coverage?type=${t}`)
-    coverage.data[t] = r.ok ? await r.json() : { count: 0, keys: {}, error: `Local read failed (${r.status})` }
-  } catch (err) { coverage.data[t] = { count: 0, keys: {}, error: err.message } }
-  coverage.loading[t] = false
-  healthMemo.clear(); renderHealth(); renderStats()
-}
-const feedsReport = (combos) => combos.some((c) => { const [tool, type] = c.split('\u0001'); return classify({ tool, toolType: type }) === 'reports' })
-function coverageRows(t) {
-  const cov = coverage.data[t]
-  const key = `cov|${t}|${filterSig()}|${activeItems(t).length}|${cov?.count}`
-  if (healthMemo.has(key)) return healthMemo.get(key)
-  const rows = objectsFor(t).filter((o) => o.cat === 'db').map((o) => {
-    let seen = 0, feeds = 0, trunc = 0
-    for (const k of o.keys) { const c = cov.keys[k]; if (!c) continue; seen++; if (c.tr) trunc++; if (feedsReport(c.c)) feeds++ }
-    return { ...o, status: !seen ? 'no lineage' : feeds ? 'feeds a report' : 'no report', trunc }
-  })
-  healthMemo.set(key, rows)
-  return rows
-}
-function renderCoverage(t) {
-  const el = $('#hCov'), cov = coverage.data[t]
-  if (!cov) { el.innerHTML = '<p class="muted small">Reading saved lineage…</p>'; loadCoverage(t); return }
-  if (cov.error) { el.innerHTML = `<p class="error small">${esc(cov.error)}</p>`; return }
-  const reports = activeItems(t).filter((x) => catOf(x) === 'reports').length
-  const rows = coverageRows(t), withL = rows.filter((r) => r.status !== 'no lineage'), feeds = withL.filter((r) => r.status === 'feeds a report')
-  const unit = t === 2 ? 'DB tables' : 'DB objects'
-  let html = `<div class="pairs"><span><b>${reports.toLocaleString()}</b> report asset${reports === 1 ? '' : 's'} in the catalog</span><span><b>${rows.length.toLocaleString()}</b> ${unit}</span><span><b>${withL.length.toLocaleString()}</b> with downloaded downstream lineage</span></div>`
-  if (!withL.length) {
-    el.innerHTML = html + `<p class="muted small">No downstream lineage is saved for these ${unit} yet. Open <b>Lineage Download</b>, choose ${TYPE_NAME[t]} assets and the Downstream direction, then come back here.</p>`
-    return
-  }
-  html = `<div class="verdict${feeds.length === withL.length ? ' fine' : ''}"><b>${pctTxt(feeds.length, withL.length)}</b> of ${unit} with downstream lineage feed at least one report (${feeds.length.toLocaleString()} of ${withL.length.toLocaleString()}). <b>${(withL.length - feeds.length).toLocaleString()}</b> feed no report.</div>` + html
-  if (withL.length < rows.length) html += `<p class="muted small">${(rows.length - withL.length).toLocaleString()} ${unit} have no downloaded downstream lineage, so they are not counted. Download more lineage to include them.</p>`
-  const truncN = withL.filter((r) => r.trunc).length
-  if (truncN) html += `<p class="muted small">${truncN.toLocaleString()} graphs hit the node limit, so a few "no report" results may be wrong.</p>`
-  const bySchema = new Map()
-  for (const r of withL) { const s = bySchema.get(r.schema) || { schema: r.schema, n: 0, feeds: 0 }; s.n++; if (r.status === 'feeds a report') s.feeds++; bySchema.set(r.schema, s) }
-  const sch = [...bySchema.values()].sort((a, b) => b.n - a.n).slice(0, 12)
-  html += `<h4>Report coverage by schema</h4><div class="hbars">${sch.map((s) => `<div class="hbar"><span title="${esc(s.schema)}">${esc(s.schema)}</span><span class="tr"><i style="width:${s.feeds / s.n * 100}%;--c:var(--c-reports)"></i></span><span class="v">${s.feeds.toLocaleString()} of ${s.n.toLocaleString()} · ${pctTxt(s.feeds, s.n)}</span></div>`).join('')}</div>`
-  const none = withL.filter((r) => r.status === 'no report').sort((a, b) => a.path.localeCompare(b.path))
-  if (none.length) {
-    html += `<h4>${unit} that feed no report</h4><div class="scroll"><table class="ev htable"><tr><th>Object</th><th>Type</th><th>Connection</th></tr>` +
-      none.slice(0, healthUi.cov).map((r) => `<tr><td title="${esc(r.path)}">${esc(r.path)}</td><td>${esc(r.type)}</td><td>${esc(r.conn)}</td></tr>`).join('') + '</table></div>'
-    html += `<div class="muted small">Showing ${Math.min(healthUi.cov, none.length).toLocaleString()} of ${none.length.toLocaleString()}. ${none.length > healthUi.cov ? '<button class="linkbtn" type="button" data-more="cov">Show 50 more</button> ' : ''}</div>`
-  }
-  html += '<div class="muted small"><button class="linkbtn" type="button" data-csv="cov">Download report coverage as CSV</button> · <button class="linkbtn" type="button" data-covreload>Re-read saved lineage</button></div>'
-  el.innerHTML = html
-}
-
-$('#healthPanel').addEventListener('click', (e) => {
-  const t = selType(), b = e.target.closest('button'); if (!b) return
-  if (b.dataset.more) { healthUi[b.dataset.more] = b.dataset.more === 'schemas' ? 1e9 : healthUi[b.dataset.more] + 50; renderHealth(); return }
-  if (b.dataset.rule !== undefined) { healthUi.rule = healthUi.rule === b.dataset.rule ? '' : b.dataset.rule; healthUi.cleanup = 25; renderHealth(); return }
-  if (b.dataset.covreload !== undefined) { delete coverage.data[t]; renderHealth(); return }
-  const kind = b.dataset.csv; if (!kind) return
-  if (kind === 'schemas') csvDownload(['schema', 'assets', 'assets_with_link_counts', 'orphans', 'cleanup_candidates', 'connections', 'tools'], schemaRows(t).map((r) => [r.schema, r.assets, r.linked, r.orphans, r.cleanup, [...r.conns].join('; '), [...r.tools].join('; ')]), `schemas-${TYPE_NAME[t]}`)
-  if (kind === 'cleanup') csvDownload(['object', 'name', 'schema', 'reason', 'type', 'connection', 'tool', 'lineage', 'columns'], objectsFor(t).filter((o) => o.rule).map((o) => [o.path, o.name, o.schema, CLEANUP_RULES.find((r) => r.id === o.rule)?.name, o.type, o.conn, o.tool, lineageTxt(o), o.cols]), `cleanup-candidates-${TYPE_NAME[t]}`)
-  if (kind === 'dupes') csvDownload(['name', 'schema_count', 'schema', 'object', 'type', 'connection', 'lineage'], dupeGroups(t).flatMap((g) => g.objs.map((o) => [g.name, g.objs.length, o.schema, o.path, o.type, o.conn, lineageTxt(o)])), `same-name-${TYPE_NAME[t]}`)
-  if (kind === 'cov') csvDownload(['object', 'schema', 'type', 'connection', 'tool', 'report_coverage', 'possibly_incomplete'], coverageRows(t).map((r) => [r.path, r.schema, r.type, r.conn, r.tool, r.status, r.trunc ? 'yes' : '']), `report-coverage-${TYPE_NAME[t]}`)
-})
-
-// ---------- Lineage Explorer: three columns like Octopai's dashboard, plus impact analysis for one asset ----------
-const XCOLS = [
-  { id: 'src', name: 'ETLs, Stored Procedures & SQL Files', cats: ['etl', 'sp'], color: 'sp' },
-  { id: 'db', name: 'DB Objects, Files & Analysis Services', cats: ['db', 'files', 'other'], color: 'db' },
-  { id: 'rep', name: 'Reports, Analytics & Information Consumers', cats: ['reports'], color: 'reports' },
-]
-const X_SHOW = 200
-const xUi = { q: '', imp: null, impShow: 100 }
-const xMemo = new Map()
-const catName = (id) => CATEGORY_ORDER.find((c) => c.id === id)?.name || id
-const nodeCat = (n) => classify({ tool: n.tool, toolType: n.type })
-function xEntries(t) {
-  const items = activeItems(t), key = `${filterSig()}|${items.length}`, hit = xMemo.get(t)
-  if (hit?.key === key) return hit.v
-  const list = items.map((x) => {
-    const cat = catOf(x)
-    return { x, cat, col: (XCOLS.find((c) => c.cats.includes(cat)) || XCOLS[1]).id, name: t === 1 ? (x.n || x.tb || x.l) : [x.tb, x.n].filter(Boolean).join('.') || x.l, sub: schemaOf(x) }
-  })
-  for (const e of list) e.lower = `${e.name} ${e.sub} ${e.x.c} ${e.x.tool}`.toLowerCase()
-  list.sort((a, b) => a.name.localeCompare(b.name))
-  const v = { list, byKey: new Map(list.map((e) => [e.x.k, e])) }
-  xMemo.set(t, { key, v })
-  return v
-}
-
-function renderExplorer() {
-  if (state.tab !== 'explorer') return
-  const t = selType(), a = state.assets[t]
-  if (!a?.done) { $('#xCols').innerHTML = waitMsg(t); $('#xNote').innerHTML = ''; renderImpact(); return }
-  if (xUi.imp && xUi.imp.t !== t) xUi.imp = null
-  const { list } = xEntries(t)
-  const terms = xUi.q.toLowerCase().split(/\s+/).filter(Boolean)
-  const hits = terms.length ? list.filter((e) => terms.every((w) => e.lower.includes(w))) : list
-  $('#xNote').innerHTML = filterNote() + `<p class="muted small">${terms.length ? `${hits.length.toLocaleString()} of ${list.length.toLocaleString()}` : list.length.toLocaleString()} ${TYPE_NAME[t]} assets${t === 2 ? ' (columns)' : ''}. Switch the asset type at the top right.</p>`
-  const selK = xUi.imp?.it.k
-  $('#xCols').innerHTML = XCOLS.map((c) => {
-    const arr = hits.filter((e) => e.col === c.id)
-    return `<div class="xcol" style="--c:var(--c-${c.color})"><div class="xhead"><span>${esc(c.name)}</span><span class="ct">${arr.length.toLocaleString()}</span></div><div class="xlist">` +
-      (arr.length ? arr.slice(0, X_SHOW).map((e) => `<button type="button" class="xitem${e.x.k === selK ? ' on' : ''}" data-xk="${esc(e.x.k)}" title="${esc(e.x.l)}"><span class="xn">${esc(e.name)}</span><span class="xs">${esc(e.sub)}${c.id === 'db' && (e.x.ot || e.x.ct) ? `<span class="badge">${esc(e.x.ot || e.x.ct)}</span>` : ''}</span></button>`).join('') : '<p class="muted small xempty">Nothing here.</p>') +
-      `</div>${arr.length > X_SHOW ? `<div class="muted small xmore">Showing ${X_SHOW} of ${arr.length.toLocaleString()}. Search to narrow it down.</div>` : ''}</div>`
-  }).join('')
-  renderImpact()
-}
-let xTimer = 0
-$('#xSearch').addEventListener('input', (e) => { clearTimeout(xTimer); xTimer = setTimeout(() => { xUi.q = e.target.value; renderExplorer() }, 150) })
-$('#xCols').addEventListener('click', (e) => { const b = e.target.closest('[data-xk]'); if (b) selectAsset(b.dataset.xk) })
-
-function selectAsset(k, scroll = true) {
-  const t = selType(), e = xEntries(t).byKey.get(k); if (!e) return
-  xUi.impShow = 100
-  loadImpact(t, e.x, false)
-  document.querySelectorAll('#xCols .xitem').forEach((b) => b.classList.toggle('on', b.dataset.xk === k))
-  if (scroll) $('#xImpact').scrollIntoView({ behavior: 'smooth', block: 'start' })
-}
-
-// Reads saved lineage for the asset (lineage downloads, and the keyword-scan cache for columns). Anything missing is
-// fetched live from Octopai and appended to data/exports/<site>/explorer-<date>.ndjson so it is saved for next time.
-async function loadImpact(t, it, force) {
-  const imp = xUi.imp = { t, it, up: null, down: null, source: {}, status: 'loading', error: '' }
-  renderImpact()
-  try {
-    if (!force) for (const d of [1, 2]) {
-      const { found } = await jpost(`/local/${state.tenant}/lineage`, { type: t, direction: d, keys: [it.k] })
-      const g = found[it.k]
-      if (g) { imp[d === 1 ? 'up' : 'down'] = { nodes: g.nodes || [], truncated: !!g.truncated }; imp.source[d] = g.source === 'saved scan' ? 'saved keyword scan' : 'saved lineage' }
-    }
-    const lines = []
-    for (const d of [1, 2]) {
-      const side = d === 1 ? 'up' : 'down'
-      if (imp[side]) continue
-      if (!state.token) throw new Error('Not connected to Octopai, and no saved lineage was found for this asset.')
-      imp.status = 'fetching'; if (xUi.imp === imp) renderImpact()
-      const r = await lineageRaw(it.k, t, d)
-      imp[side] = { nodes: r.nodes, truncated: r.truncated }; imp.source[d] = 'live from Octopai'
-      lines.push(JSON.stringify({ t, key: it.k, label: it.l, dir: DIR_NAME[d], truncated: r.truncated, nodes: r.nodes, edges: r.edges }))
-    }
-    if (lines.length) {
-      try { await fetch(`/export/${state.tenant}/explorer-${new Date().toISOString().slice(0, 10)}`, { method: 'POST', body: lines.join('\n') + '\n' }) } catch { /* saving is best effort */ }
-      coverage.data = {}; refreshLocalStatus()
-    }
-    imp.status = 'done'
-  } catch (err) { imp.status = 'error'; imp.error = err.message }
-  if (xUi.imp === imp) renderImpact()
-}
-
-function laneHtml(nodes, byKey) {
-  if (!nodes.length) return '<p class="muted small">None found.</p>'
-  const groups = new Map()
-  for (const n of nodes) { const c = nodeCat(n); if (!groups.has(c)) groups.set(c, []); groups.get(c).push(n) }
-  return CATEGORY_ORDER.filter((c) => groups.has(c.id)).map((c) => {
-    const list = groups.get(c.id).sort((a, b) => a.depth - b.depth || a.name.localeCompare(b.name))
-    return `<div class="lgroup" style="--c:var(--c-${c.id})"><div class="lgh"><span>${esc(c.name)}</span><b>${list.length.toLocaleString()}</b></div>` +
-      list.slice(0, 8).map((n) => { const go = byKey.has(n.key); return `<div class="lnode${go ? ' go' : ''}"${go ? ` data-xk="${esc(n.key)}" role="button" tabindex="0"` : ''} title="${esc([n.connection, n.db, n.schema, n.table, n.name].filter(Boolean).join(' › '))}"><span>${esc(n.name || n.table || n.key)}</span><span class="muted small">hop ${n.depth}</span></div>` }).join('') +
-      (list.length > 8 ? `<div class="muted small">+${(list.length - 8).toLocaleString()} more in the table below</div>` : '') + '</div>'
-  }).join('')
-}
-const countPhrase = (nodes) => {
-  const m = new Map(); for (const n of nodes) { const c = nodeCat(n); m.set(c, (m.get(c) || 0) + 1) }
-  const short = { etl: ['ETL', 'ETLs'], sp: ['stored procedure or SQL file', 'stored procedures or SQL files'], db: ['DB object', 'DB objects'], files: ['file or analysis service', 'files or analysis services'], reports: ['report', 'reports'], other: ['unclassified asset', 'unclassified assets'] }
-  return CATEGORY_ORDER.filter((c) => m.has(c.id)).map((c) => { const n = m.get(c.id); return `${n.toLocaleString()} ${short[c.id][n === 1 ? 0 : 1]}` }).join(', ')
-}
-function impactRows(imp) {
-  return [...imp.up.nodes.map((n) => ['Upstream', n]), ...imp.down.nodes.map((n) => ['Downstream', n])]
-    .sort((a, b) => a[0].localeCompare(b[0]) * -1 || a[1].depth - b[1].depth || String(a[1].name).localeCompare(String(b[1].name)))
-}
-function renderImpact() {
-  const el = $('#xImpact'), imp = xUi.imp
-  if (!imp) { el.innerHTML = '<h2>Impact analysis</h2><p class="muted">Click any asset above to see what it depends on (upstream) and what would be affected if it changed (downstream), including which reports.</p>'; return }
-  const t = imp.t, e = xEntries(t).byKey.get(imp.it.k), byKey = xEntries(t).byKey
-  const name = e?.name || imp.it.l
-  let html = `<div class="ovhead"><h2>Impact analysis</h2><span class="noprint">${imp.status === 'done' ? '<button class="linkbtn" type="button" data-ximp="csv">Download CSV</button> · ' : ''}<button class="linkbtn" type="button" data-ximp="refresh"${['loading', 'fetching'].includes(imp.status) ? ' disabled' : ''}>Refresh from Octopai</button></span></div>`
-  html += `<div class="xsel" style="--c:var(--c-${e?.cat || 'other'})"><b>${esc(name)}</b><span class="muted small">${esc(imp.it.l)}</span><span class="badge">${esc(imp.it.tool)}</span><span class="badge">${esc(catName(e?.cat || 'other'))}</span></div>`
-  if (imp.status === 'loading') { el.innerHTML = html + '<p class="muted small">Reading saved lineage…</p>'; return }
-  if (imp.status === 'fetching') { el.innerHTML = html + '<p class="muted small">Fetching lineage from Octopai… It is saved on this computer for next time.</p>'; return }
-  if (imp.status === 'error') { el.innerHTML = html + `<p class="error small">${esc(imp.error)}</p>`; return }
-  const up = imp.up.nodes, down = imp.down.nodes
-  const reports = down.filter((n) => nodeCat(n) === 'reports').length
-  html += `<div class="verdict${down.length ? '' : ' fine'}">` + (down.length
-    ? `Changing <b>${esc(name)}</b> could affect <b>${down.length.toLocaleString()}</b> downstream asset${down.length === 1 ? '' : 's'}${reports ? `, including <b>${reports.toLocaleString()} report${reports === 1 ? '' : 's'}</b>` : ''}${new Set(down.map(nodeCat)).size > 1 ? `: ${esc(countPhrase(down))}` : ''}.`
-    : `Nothing downstream uses <b>${esc(name)}</b>.`) +
-    ` ${up.length ? `It gets data from <b>${up.length.toLocaleString()}</b> upstream asset${up.length === 1 ? '' : 's'}.` : 'It has no upstream sources.'}</div>`
-  html += `<div class="lanes"><div class="lane"><h4>Upstream (sources)</h4>${laneHtml(up, byKey)}</div><div class="lane mid"><div class="xnode" style="--c:var(--c-${e?.cat || 'other'})">${esc(name)}</div></div><div class="lane"><h4>Downstream (consumers)</h4>${laneHtml(down, byKey)}</div></div>`
-  const rows = impactRows(imp)
-  if (rows.length) {
-    html += `<h4>All related assets</h4><div class="scroll"><table class="ev htable"><tr><th>Direction</th><th class="rt">Hop</th><th>Name</th><th>Category</th><th>Location</th><th>Tool</th></tr>` +
-      rows.slice(0, xUi.impShow).map(([dir, n]) => `<tr><td>${dir}</td><td class="rt">${n.depth}</td><td title="${esc(n.name)}">${byKey.has(n.key) ? `<button type="button" class="linkbtn tlink" data-xk="${esc(n.key)}">${esc(n.name)}</button>` : esc(n.name)}</td><td>${esc(catName(nodeCat(n)))}</td><td title="${esc([n.connection, n.db, n.schema, n.table].filter(Boolean).join(' › '))}">${esc([n.connection, n.db, n.schema, n.table].filter(Boolean).join(' › '))}</td><td>${esc(n.tool)}</td></tr>`).join('') + '</table></div>'
-    html += `<div class="muted small">Showing ${Math.min(xUi.impShow, rows.length).toLocaleString()} of ${rows.length.toLocaleString()}. ${rows.length > xUi.impShow ? '<button class="linkbtn" type="button" data-ximp="more">Show 100 more</button>' : ''}</div>`
-  }
-  const notes = [`Upstream: ${imp.source[1]}`, `downstream: ${imp.source[2]}`, `up to ${DEPTH} hops`]
-  if (imp.up.truncated || imp.down.truncated) notes.push('a graph hit the node limit, so the lists may be incomplete')
-  html += `<p class="muted small">${esc(notes.join(' · '))}. Names you can click are in the current asset list and open their own impact analysis.</p>`
-  el.innerHTML = html
-}
-$('#xImpact').addEventListener('click', (e) => {
-  const go = e.target.closest('[data-xk]'); if (go) { selectAsset(go.dataset.xk); return }
-  const b = e.target.closest('[data-ximp]'); if (!b || !xUi.imp) return
-  const imp = xUi.imp
-  if (b.dataset.ximp === 'refresh') loadImpact(imp.t, imp.it, true)
-  if (b.dataset.ximp === 'more') { xUi.impShow += 100; renderImpact() }
-  if (b.dataset.ximp === 'csv') {
-    const name = xEntries(imp.t).byKey.get(imp.it.k)?.name || imp.it.l
-    csvDownload(['selected_asset', 'selected_path', 'direction', 'hop', 'related_name', 'category', 'connection', 'db', 'schema', 'table', 'tool', 'tool_type', 'related_key'],
-      impactRows(imp).map(([dir, n]) => [name, imp.it.l, dir, n.depth, n.name, catName(nodeCat(n)), n.connection, n.db, n.schema, n.table, n.tool, n.type, n.key]),
-      `impact-${String(name).replace(/[^\w-]+/g, '_').slice(0, 40)}`)
-  }
-})
-$('#xImpact').addEventListener('keydown', (e) => { if (e.key === 'Enter' && e.target.matches('.lnode.go')) selectAsset(e.target.dataset.xk) })
-
-// ---------- Overview stat cards ----------
-// Degree = lineage links in + links out, from the link counts Octopai returns with each asset (all assets, not a sample).
-const HIGH_IMPACT_DEGREE = 4
-const statsMemo = new Map()
-function linkStats(t) {
-  const items = activeItems(t), key = `${filterSig()}|${items.length}`, hit = statsMemo.get(t)
-  if (hit?.key === key) return hit.v
-  let counted = 0, linked = 0, orphans = 0, high = 0, top = null
-  for (const x of items) {
-    if (x.ins == null || x.outs == null) continue
-    counted++
-    const d = x.ins + x.outs
-    if (d > 0) linked++; else orphans++
-    if (d >= HIGH_IMPACT_DEGREE) high++
-    if (!top || d > top.ins + top.outs) top = x
-  }
-  const v = { counted, linked, orphans, high, top, total: items.length }
-  statsMemo.set(t, { key, v })
-  return v
-}
-function depthStats(t) {
-  const cov = coverage.data[t]; if (!cov) return null
-  const buckets = new Map(); let chains = 0, sum = 0
-  for (const x of activeItems(t)) { const c = cov.keys[x.k]; if (!c) continue; const md = c.md || 0; chains++; sum += md; buckets.set(md, (buckets.get(md) || 0) + 1) }
-  return { chains, avg: chains ? sum / chains : 0, buckets }
-}
-function renderStats() {
-  const el = $('#stats'); if (!el) return
-  const t = selType(), a = state.assets[t], a1 = state.assets[1]
-  const card = (cls, title, value, sub, tip, extra = '') => `<div class="stat ${cls}" title="${esc(tip)}"${extra}><div class="st">${esc(title)}</div><div class="sv">${value}</div><div class="ss">${sub}</div></div>`
-  const typeNote = t === 2 ? ' (column-level)' : ''
-  if (!a?.done && !a1?.done) { el.innerHTML = ''; return }
-  const cards = []
-  if (a?.done) {
-    const s = linkStats(t)
-    const noCounts = !s.counted
-    cards.push(card('s-impact', `High Impact Objects${typeNote}`, noCounts ? '–' : s.high.toLocaleString(), noCounts ? 'no link counts in this asset list' : `Objects with lineage in + out ≥ ${HIGH_IMPACT_DEGREE} · ${pctTxt(s.high, s.counted)} of assets`, 'Assets with at least 4 lineage links (in plus out), counted over every asset, not a sample.'))
-    if (s.top && s.top.ins + s.top.outs > 0) {
-      const x = s.top, name = t === 1 ? (x.n || x.tb || x.l) : [x.tb, x.n].filter(Boolean).join('.')
-      cards.push(card('s-top', `Most Connected Object${typeNote}`, `<span class="sname">${esc(name)}</span>`, `${esc(x.c || x.tool)} · degree ${(x.ins + x.outs).toLocaleString()} (${x.ins.toLocaleString()} in, ${x.outs.toLocaleString()} out)`, 'The asset with the most lineage links. Click to open it in the Lineage Explorer.', ` data-statgo="${esc(x.k)}" role="button" tabindex="0"`))
-    } else cards.push(card('s-top', `Most Connected Object${typeNote}`, '–', noCounts ? 'no link counts in this asset list' : 'no asset has lineage links', ''))
-  } else cards.push(card('s-impact', 'High Impact Objects', '–', 'still loading…', ''), card('s-top', 'Most Connected Object', '–', 'still loading…', ''))
-  if (a1?.done) {
-    const by = new Map(); for (const x of activeItems(1)) { const k = normType(x.tt); by.set(k, (by.get(k) || 0) + 1) }
-    const label = { ETL: 'ETL', DB: 'DB', REPORT: 'Reports' }
-    const order = [...by.keys()].sort((p, q) => ((TYPE_ORDER.indexOf(p) + 1) || 99) - ((TYPE_ORDER.indexOf(q) + 1) || 99))
-    cards.push(card('s-cross', 'Cross-System Objects', activeItems(1).length.toLocaleString(), order.map((k) => `${esc(label[k] || k)}: ${by.get(k).toLocaleString()}`).join(' · '), 'Cross-system assets by tool type.'))
-  } else cards.push(card('s-cross', 'Cross-System Objects', '–', 'still loading…', ''))
-  if (a?.done) {
-    const d = depthStats(t)
-    if (!d) { cards.push(card('s-depth', `Pipeline Depth${typeNote}`, '–', 'reading saved lineage…', '')); loadCoverage(t) }
-    else if (!d.chains) cards.push(card('s-depth', `Pipeline Depth${typeNote}`, '–', 'Download downstream lineage (Lineage Download tab) to measure this', ''))
-    else {
-      const ks = [...d.buckets.keys()].sort((p, q) => p - q)
-      const shown = ks.slice(0, 3).map((k) => `${k} hop${k === 1 ? '' : 's'}: ${d.buckets.get(k).toLocaleString()}`)
-      const rest = ks.slice(3).reduce((s2, k) => s2 + d.buckets.get(k), 0)
-      if (rest) shown.push(`${ks[3]}+ hops: ${rest.toLocaleString()}`)
-      cards.push(card('s-depth', `Pipeline Depth${typeNote}`, `${d.chains.toLocaleString()} chains`, `avg ${d.avg.toFixed(1)} hops · ${shown.join(', ')}`, 'For every asset with downloaded downstream lineage: how many hops its longest downstream chain has.'))
-    }
-    const s = linkStats(t)
-    cards.push(card('s-health', `Lineage Health${typeNote}`, s.counted ? pctTxt(s.linked, s.counted).replace('.0%', '%') : '–', s.counted ? `${s.linked.toLocaleString()} of ${s.counted.toLocaleString()} assets have lineage · ${s.orphans.toLocaleString()} orphan${s.orphans === 1 ? '' : 's'}` : 'no link counts in this asset list', 'Share of assets with at least one lineage link, counted over every asset.'))
-  } else cards.push(card('s-depth', 'Pipeline Depth', '–', 'still loading…', ''), card('s-health', 'Lineage Health', '–', 'still loading…', ''))
-  el.innerHTML = cards.join('')
-}
-$('#stats').addEventListener('click', (e) => { const c = e.target.closest('[data-statgo]'); if (!c) return; setTab('explorer'); selectAsset(c.dataset.statgo) })
-$('#stats').addEventListener('keydown', (e) => { const c = e.target.closest('[data-statgo]'); if (c && e.key === 'Enter') { setTab('explorer'); selectAsset(c.dataset.statgo) } })

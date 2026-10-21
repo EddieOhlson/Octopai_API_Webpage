@@ -60,7 +60,7 @@ Updating does not touch the `data/` folder, so your saved catalog, user events a
 1. Enter the site name, for example `demo` for `demo.octopai.com`. For regional sites, enter `demo.eu` for `demo.eu.octopai.com`.
 2. Log in with your Octopai username and password.
 3. The catalog and user events load first. Use the tabs to explore, and the Cross-system / Column-level switch to change which asset type the breakdown and orphans describe.
-4. Optional: open **Lineage Download** to download lineage. This finds confirmed orphans and broken links, and it feeds the local keyword scan.
+4. Optional: open **Lineage Download** to download lineage. This finds confirmed orphans and broken links, and it feeds the local keyword scan. Assets that already have saved lineage are skipped by default (you can choose to refresh anything older than 7, 30 or 90 days). The limit box counts only assets that still need downloading, so repeating a run with a limit works through the list in steps.
 5. Open **Keyword Scan**, enter keywords such as `email, ssn`, choose Source or Consumer columns, and scan. If some columns have no saved lineage, use the "Fetch lineage for the missing columns" button.
 
 If your token expires during a long run, a prompt asks for your password again and the run continues without losing results.
