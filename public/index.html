@@ -42,27 +42,36 @@
       </div>
     </div>
 
-    <!-- KPI strip -->
-    <div id="kpis" class="kpis"></div>
-    <p id="catWarn" class="warnbox small" hidden></p>
-
     <!-- Tabs + asset type switch -->
     <div class="tabbar noprint">
       <div class="tabs" role="tablist">
         <button class="tab" role="tab" data-tab="overview">Overview</button>
+        <button class="tab" role="tab" data-tab="explorer">Lineage Explorer</button>
         <button class="tab" role="tab" data-tab="orphans">Orphans &amp; Health <span id="tabOrph" class="tabbadge" hidden></span></button>
         <button class="tab" role="tab" data-tab="users">Users &amp; Activity <span id="tabEv" class="tabbadge" hidden></span></button>
         <button class="tab" role="tab" data-tab="download">Lineage Download</button>
+        <button class="tab" role="tab" data-tab="health">Catalog Health</button>
         <button class="tab" role="tab" data-tab="scan">Keyword Scan</button>
       </div>
-      <div class="seg" id="typeSeg" role="radiogroup" aria-label="Asset type">
-        <label><input type="radio" name="bdtype" value="1" checked><span>Cross-system</span></label>
-        <label><input type="radio" name="bdtype" value="2"><span>Column-level</span></label>
+      <div class="tabright">
+        <div class="srcpick">
+          <button id="srcBtn" class="ghost" type="button" disabled title="Load assets first">Sources</button>
+          <div id="srcPanel" class="srcpanel" hidden></div>
+        </div>
+        <div class="seg" id="typeSeg" role="radiogroup" aria-label="Asset type">
+          <label><input type="radio" name="bdtype" value="1" checked><span>Cross-system</span></label>
+          <label><input type="radio" name="bdtype" value="2"><span>Column-level</span></label>
+        </div>
       </div>
     </div>
 
+    <!-- KPI strip -->
+    <div id="kpis" class="kpis"></div>
+    <p id="catWarn" class="warnbox small" hidden></p>
+
     <!-- Overview -->
     <section class="panel" data-panel="overview">
+      <div id="stats" class="statcards"></div>
       <div class="grid2">
         <div class="card">
           <div class="ovhead"><h2>Connections <span id="connHead" class="muted small"></span></h2><span id="catState" class="muted small"></span></div>
@@ -78,6 +87,17 @@
       </div>
     </section>
 
+    <!-- Lineage explorer and impact analysis -->
+    <section class="panel" data-panel="explorer" id="explorerPanel" hidden>
+      <div class="card">
+        <div class="ovhead"><h2>Lineage Explorer</h2><span class="muted small">click an asset to see its impact</span></div>
+        <input id="xSearch" type="search" placeholder="Search names, schemas, connections or tools, e.g. customer or sales orders" autocomplete="off">
+        <div id="xNote"></div>
+        <div id="xCols" class="xcols"></div>
+      </div>
+      <div class="card" id="xImpact"></div>
+    </section>
+
     <!-- Orphans -->
     <section class="panel" data-panel="orphans" hidden>
       <div class="card" id="orphanBlock">
@@ -91,6 +111,27 @@
       <div class="card">
         <div class="ovhead"><h2>User Events</h2><span id="evState" class="muted small"></span></div>
         <div id="evBody" class="muted">Waiting…</div>
+      </div>
+    </section>
+
+    <!-- Catalog health -->
+    <section class="panel" data-panel="health" id="healthPanel" hidden>
+      <div id="hNote"></div>
+      <div class="card">
+        <div class="ovhead"><h2>Breakdown by schema</h2><span class="muted small">assets, orphans and cleanup candidates per schema</span></div>
+        <div id="hSchemas"></div>
+      </div>
+      <div class="card">
+        <div class="ovhead"><h2>Cleanup candidates</h2><span class="muted small">rules in health-rules.js</span></div>
+        <div id="hCleanup"></div>
+      </div>
+      <div class="card">
+        <div class="ovhead"><h2>Same name in several schemas</h2></div>
+        <div id="hDupes"></div>
+      </div>
+      <div class="card">
+        <div class="ovhead"><h2>Report coverage</h2><span class="muted small">from downloaded downstream lineage</span></div>
+        <div id="hCov"></div>
       </div>
     </section>
 
@@ -203,6 +244,7 @@
   </div>
 </footer>
 <script src="categories.js"></script>
+<script src="health-rules.js"></script>
 <script src="app.js"></script>
 </body>
 </html>

@@ -4,12 +4,14 @@ import https from 'node:https'
 import fs from 'node:fs'
 import path from 'node:path'
 import readline from 'node:readline'
+import zlib from 'node:zlib'
+import { pipeline } from 'node:stream/promises'
 import { fileURLToPath } from 'node:url'
 
 const ROOT = path.dirname(fileURLToPath(import.meta.url))
 const PUBLIC = path.join(ROOT, 'public')
 const DATA = path.join(ROOT, 'data')
-const PORT = Number(process.env.PORT || 5190)   // Fathom (vite) uses 5173; this project uses 5190
+const PORT = Number(process.env.PORT || 5191)   // Fathom (vite) uses 5173; this project uses 5191
 const HOST_RE = /^[a-z0-9-]+(\.[a-z0-9-]+)*\.octopai\.com$/i   // only ever proxy to Octopai tenants
 const TENANT_RE = /^[a-z0-9-]+(\.[a-z0-9-]+)*$/i   // dots allowed for regional sites like demo.eu
 
@@ -48,7 +50,10 @@ function proxy(req, res) {
     res.writeHead(ur.statusCode || 502, out)
     ur.pipe(res)
   })
-  up.on('error', (e) => send(res, 502, { error: `Upstream error: ${e.message}` }))
+  // Give up on Octopai if it sends nothing for 4 minutes, and stop the request if the page stops waiting for it.
+  up.setTimeout(4 * 60 * 1000, () => up.destroy(new Error('Octopai did not answer within 4 minutes')))
+  res.on('close', () => { if (!res.writableFinished) up.destroy() })
+  up.on('error', (e) => { if (!res.headersSent) send(res, 504, { error: `Upstream error: ${e.message}` }); else res.destroy() })
   req.pipe(up)
 }
 
@@ -93,33 +98,98 @@ async function exportRoute(req, res) {
 }
 
 // ---- local files: saved assets and saved lineage, used by the keyword scan ----
-const assetsFile = (tenant, t) => path.join(DATA, `${tenant}.assets${t}.ndjson`)
+// Saved asset lists are gzipped NDJSON so catalogs with millions of assets stay small on disk and are never held in
+// memory as one big string. Format v3:
+//   line 1: {"meta":{"savedAt","count","v":3}}
+//   line 2: {"dict":[...]}   repeated strings (connection, tool, types, db, schema, table) stored once
+//   then one JSON array per asset: [key, name, conn, tool, toolType, objectType, container, db, schema, table, ins, outs, flagged]
+//   where conn..table are positions in dict.
+// Older versions wrote plain <site>.assets<type>.ndjson with one JSON object per asset; those are still read.
+const assetsFile = (tenant, t) => path.join(DATA, `${tenant}.assets${t}.ndjson.gz`)
+const legacyAssetsFile = (tenant, t) => path.join(DATA, `${tenant}.assets${t}.ndjson`)
+const savedAssetsFile = (tenant, t) => [assetsFile(tenant, t), legacyAssetsFile(tenant, t)].find((f) => fs.existsSync(f)) || null
+const lineStream = (file) => readline.createInterface({ input: file.endsWith('.gz') ? fs.createReadStream(file).pipe(zlib.createGunzip()) : fs.createReadStream(file), crlfDelay: Infinity })
+async function readAssetsMeta(tenant, t) {
+  const f = savedAssetsFile(tenant, t); if (!f) return null
+  const rl = lineStream(f)
+  try { for await (const line of rl) { return JSON.parse(line).meta || null } } catch { return null } finally { rl.close() }
+  return null
+}
+// Turns one saved row (v3 array or legacy object) into the shape the keyword scan uses.
+function rowToItem(row, dict) {
+  if (!Array.isArray(row)) return row
+  const [k, n, c, tool, , , , d, sc, tb] = row
+  const D = (i) => dict[i] ?? ''
+  return { k, n, c: D(c), tool: D(tool), l: [D(d), D(sc), D(tb), n].filter(Boolean).join('.') || String(k) }
+}
 const assetMem = new Map()
-function loadAssets(tenant, t) {
-  const f = assetsFile(tenant, t)
-  if (!fs.existsSync(f)) return null
-  const st = fs.statSync(f), hit = assetMem.get(f)
-  if (hit && hit.mtime === st.mtimeMs) return hit
-  const lines = fs.readFileSync(f, 'utf8').split('\n')
-  const meta = JSON.parse(lines[0]).meta
-  const items = []
-  for (let i = 1; i < lines.length; i++) if (lines[i]) { try { items.push(JSON.parse(lines[i])) } catch { /* skip bad line */ } }
-  const entry = { mtime: st.mtimeMs, meta, items, lower: items.map((x) => String(x.n || '').toLowerCase()) }
-  assetMem.set(f, entry)
+// For the keyword scan: keeps the lowercase names and the raw rows in memory, and only builds full items for matches.
+async function loadAssets(tenant, t) {
+  const f = savedAssetsFile(tenant, t)
+  if (!f) return null
+  const st = fs.statSync(f), hit = assetMem.get(`${tenant}|${t}`)
+  if (hit && hit.file === f && hit.mtime === st.mtimeMs) return hit
+  let meta = null, dict = [], i = 0
+  const lower = [], rows = []
+  for await (const line of lineStream(f)) {
+    if (!line) continue
+    if (i++ === 0) { meta = JSON.parse(line).meta; continue }
+    if (meta?.v >= 3 && i === 2) { dict = JSON.parse(line).dict || []; continue }
+    try {
+      const row = JSON.parse(line)
+      lower.push(String((Array.isArray(row) ? row[1] : row.n) || '').toLowerCase()); rows.push(line)
+    } catch { /* skip bad line */ }
+  }
+  const entry = { file: f, mtime: st.mtimeMs, meta, dict, lower, rows, count: rows.length }
+  assetMem.set(`${tenant}|${t}`, entry)
   return entry
 }
-// PUT /assets/<tenant>/<type>: replace the saved asset list (NDJSON, one asset per line)
+// /assets/<tenant>/<type>
+//   GET               the saved list (gzipped; the browser unzips it on the fly)
+//   POST ?op=begin    start a new list: body = the meta and dict lines
+//   POST ?op=append   add rows (sent in chunks so no request is huge)
+//   POST ?op=commit   compress and replace the saved list in one step, so a half-written list is never used
+const uploading = new Map()
 async function assetsRoute(req, res) {
-  const [, , tenant, t] = req.url.split('?')[0].split('/')
+  const url = new URL(req.url, 'http://x')
+  const [, , tenant, t] = url.pathname.split('/')
   if (!TENANT_RE.test(tenant || '') || !/^[12]$/.test(t || '')) return send(res, 400, { error: 'Bad name' })
-  if (req.method !== 'PUT') return send(res, 405, { error: 'Method not allowed' })
-  const body = (await readBody(req)).toString().trim()
-  const count = body ? body.split('\n').length : 0
+  if (req.method === 'GET') {
+    const gz = assetsFile(tenant, t), legacy = legacyAssetsFile(tenant, t)
+    if (fs.existsSync(gz)) { res.writeHead(200, { 'Content-Type': 'application/x-ndjson', 'Content-Encoding': 'gzip' }); return fs.createReadStream(gz).pipe(res) }
+    if (fs.existsSync(legacy)) { res.writeHead(200, { 'Content-Type': 'application/x-ndjson' }); return fs.createReadStream(legacy).pipe(res) }
+    return send(res, 404, { error: 'No saved assets' })
+  }
+  if (req.method !== 'POST') return send(res, 405, { error: 'Method not allowed' })
   fs.mkdirSync(DATA, { recursive: true })
-  const file = assetsFile(tenant, t), tmp = `${file}.tmp`
-  fs.writeFileSync(tmp, JSON.stringify({ meta: { savedAt: Date.now(), count } }) + '\n' + body + '\n')
-  fs.renameSync(tmp, file)
-  send(res, 200, { ok: true, count })
+  const op = url.searchParams.get('op'), key = `${tenant}|${t}`, tmp = `${assetsFile(tenant, t)}.part`
+  const body = await readBody(req)
+  if (op === 'begin') { fs.writeFileSync(tmp, body); uploading.set(key, { rows: 0 }); return send(res, 200, { ok: true }) }
+  const up = uploading.get(key)
+  if (!up || !fs.existsSync(tmp)) return send(res, 409, { error: 'No upload in progress' })
+  if (op === 'append') { fs.appendFileSync(tmp, body); return send(res, 200, { ok: true }) }
+  if (op === 'commit') {
+    const out = assetsFile(tenant, t), gzTmp = `${out}.tmp`
+    await pipeline(fs.createReadStream(tmp), zlib.createGzip({ level: 6 }), fs.createWriteStream(gzTmp))
+    fs.renameSync(gzTmp, out); fs.rmSync(tmp, { force: true }); fs.rmSync(legacyAssetsFile(tenant, t), { force: true })
+    uploading.delete(key); assetMem.delete(key)
+    return send(res, 200, { ok: true, bytes: fs.statSync(out).size })
+  }
+  send(res, 400, { error: 'Unknown op' })
+}
+
+// /events/<tenant>: GET = read the saved user events, PUT = replace them (JSON { savedAt, rows }).
+async function eventsRoute(req, res) {
+  const tenant = decodeURIComponent(req.url.split('?')[0].split('/')[2] || '')
+  if (!TENANT_RE.test(tenant)) return send(res, 400, { error: 'Bad tenant name' })
+  const file = path.join(DATA, `${tenant}.events.json`)
+  if (req.method === 'GET') return fs.existsSync(file) ? send(res, 200, fs.readFileSync(file)) : send(res, 404, { error: 'No saved events' })
+  if (req.method === 'PUT') {
+    const body = await readBody(req); JSON.parse(body.toString())
+    fs.mkdirSync(DATA, { recursive: true }); fs.writeFileSync(`${file}.tmp`, body); fs.renameSync(`${file}.tmp`, file)
+    return send(res, 200, { ok: true })
+  }
+  send(res, 405, { error: 'Method not allowed' })
 }
 
 // Index of every saved lineage graph in data/exports/<tenant>/*.ndjson: key -> byte range, so graphs are read on demand.
@@ -182,7 +252,7 @@ async function localRoute(req, res) {
   if (!TENANT_RE.test(tenant || '')) return send(res, 400, { error: 'Bad tenant name' })
   if (action === 'status' && req.method === 'GET') {
     const assets = {}
-    for (const t of [1, 2]) { const e = loadAssets(tenant, t); if (e) assets[t] = { count: e.items.length, savedAt: e.meta.savedAt } }
+    for (const t of [1, 2]) { const m = await readAssetsMeta(tenant, t); if (m) assets[t] = { count: m.count, savedAt: m.savedAt } }
     const up = new Set(), down = new Set()
     for (const k of (await exportIndex(tenant)).keys()) { const [t, key, dir] = k.split('|'); if (t === '2') (dir === 'upstream' ? up : down).add(key) }
     for (const k of Object.keys(cacheLineage(tenant))) { const i = k.lastIndexOf('|'); (k.slice(i + 1) === '1' ? up : down).add(k.slice(0, i)) }
@@ -208,35 +278,71 @@ async function localRoute(req, res) {
   }
   if (action === 'find' && req.method === 'GET') {
     const t = url.searchParams.get('type') === '1' ? 1 : 2
-    const e = loadAssets(tenant, t)
+    const e = await loadAssets(tenant, t)
     if (!e) return send(res, 404, { error: 'No local catalog yet' })
     const kws = String(url.searchParams.get('keywords') || '').toLowerCase().split(',').map((x) => x.trim()).filter(Boolean).slice(0, 50)
     const matches = []
-    for (let i = 0; i < e.items.length && matches.length < 50000; i++) if (kws.some((k) => e.lower[i].includes(k))) matches.push(e.items[i])
-    return send(res, 200, { matches, savedAt: e.meta.savedAt, total: e.items.length, truncated: matches.length >= 50000 })
+    for (let i = 0; i < e.count && matches.length < 50000; i++) if (kws.some((k) => e.lower[i].includes(k))) matches.push(rowToItem(JSON.parse(e.rows[i]), e.dict))
+    return send(res, 200, { matches, savedAt: e.meta?.savedAt, total: e.count, truncated: matches.length >= 50000 })
   }
   if (action === 'lineage' && req.method === 'POST') {
-    const { direction, keys } = JSON.parse((await readBody(req)).toString())
+    const { direction, keys, type } = JSON.parse((await readBody(req)).toString())
     if (![1, 2].includes(direction) || !Array.isArray(keys)) return send(res, 400, { error: 'Bad request' })
+    const t = type === 1 ? 1 : 2   // older pages send no type: column-level
     const dirName = direction === 1 ? 'upstream' : 'downstream'
     const lin = cacheLineage(tenant), idx = await exportIndex(tenant)
     const found = {}
     for (const key of keys.slice(0, 5000)) {
-      const c = lin[`${key}|${direction}`]
+      const c = t === 2 && lin[`${key}|${direction}`]
       if (c) { found[key] = { nodes: c.nodes || [], truncated: !!c.truncated, source: 'saved scan' }; continue }
-      const e = idx.get(`2|${key}|${dirName}`)
+      const e = idx.get(`${t}|${key}|${dirName}`)
       if (e) { try { const g = readGraph(e); found[key] = { nodes: g.nodes || [], truncated: !!g.truncated, source: 'lineage download' } } catch { /* unreadable line */ } }
     }
     return send(res, 200, { found })
   }
+  if (action === 'coverage' && req.method === 'GET') {
+    const t = url.searchParams.get('type') === '2' ? 2 : 1
+    return send(res, 200, await coverageFor(tenant, t))
+  }
   send(res, 404, { error: 'Unknown local action' })
+}
+
+// Report coverage: for every asset with saved downstream lineage, the distinct tool/tool-type pairs it reaches.
+// The page decides which of those count as reports (using categories.js). Later downloads override earlier ones.
+const covMemo = new Map()
+async function coverageFor(tenant, t) {
+  const dir = path.join(DATA, 'exports', tenant)
+  const files = fs.existsSync(dir) ? fs.readdirSync(dir).filter((f) => f.endsWith('.ndjson')).sort() : []
+  const cf = path.join(DATA, `${tenant}.catalog.json`)
+  const sig = files.map((n) => { const st = fs.statSync(path.join(dir, n)); return `${n}|${st.size}|${st.mtimeMs}` }).join(';') + `#${fs.existsSync(cf) ? fs.statSync(cf).mtimeMs : ''}`
+  const memoKey = `${tenant}|${t}`, memo = covMemo.get(memoKey)
+  if (memo && memo.sig === sig) return memo.out
+  const keys = {}
+  const add = (key, nodes, truncated) => {
+    const s = new Set(); let md = 0
+    for (const n of nodes || []) { s.add(`${n.tool || ''}\u0001${n.type || ''}`); if (Number(n.depth) > md) md = Number(n.depth) }
+    keys[key] = { c: [...s], tr: truncated ? 1 : 0, md }
+  }
+  if (t === 2) for (const [k, v] of Object.entries(cacheLineage(tenant))) { const i = k.lastIndexOf('|'); if (k.slice(i + 1) === '2') add(k.slice(0, i), v.nodes, v.truncated) }
+  for (const name of files) {
+    for await (const line of readline.createInterface({ input: fs.createReadStream(path.join(dir, name)) })) {
+      if (!line.trim()) continue
+      let g; try { g = JSON.parse(line) } catch { continue }
+      if (Number(g.t) === t && g.dir === 'downstream' && !g.error && g.key) add(g.key, g.nodes, g.truncated)
+    }
+  }
+  const out = { count: Object.keys(keys).length, keys }
+  covMemo.set(memoKey, { sig, out })
+  return out
 }
 
 function serveStatic(req, res) {
   const rel = req.url.split('?')[0]
   const file = path.normalize(path.join(PUBLIC, rel === '/' ? 'index.html' : rel))
   if (!file.startsWith(PUBLIC) || !fs.existsSync(file) || fs.statSync(file).isDirectory()) return send(res, 404, 'Not found', 'text/plain')
-  send(res, 200, fs.readFileSync(file), MIME[path.extname(file)] || 'application/octet-stream')
+  // no-cache: the browser always checks for a newer copy, so after an update a normal reload picks up the new page.
+  res.writeHead(200, { 'Content-Type': MIME[path.extname(file)] || 'application/octet-stream', 'Cache-Control': 'no-cache' })
+  res.end(fs.readFileSync(file))
 }
 
 http.createServer(async (req, res) => {
@@ -246,6 +352,7 @@ http.createServer(async (req, res) => {
     if (req.url.startsWith('/export/')) return await exportRoute(req, res)
     if (req.url.startsWith('/assets/')) return await assetsRoute(req, res)
     if (req.url.startsWith('/local/')) return await localRoute(req, res)
+    if (req.url.startsWith('/events/')) return await eventsRoute(req, res)
     return serveStatic(req, res)
   } catch (e) { send(res, 500, { error: e.message }) }
 }).listen(PORT, '127.0.0.1', () => console.log(`api_webpage running at http://localhost:${PORT}`))
