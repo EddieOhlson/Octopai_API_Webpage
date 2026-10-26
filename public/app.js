@@ -160,6 +160,7 @@ async function enterApp() {
   $('#userName').textContent = state.user
   document.title = `Lineage Scan · ${state.tenant}`
   state.showAllConns = false; state.dl = null; state.local = null; state.srcTouched = false
+  state.assets = { 1: null, 2: null }; state.events = null; state.run = null; state.findings = null; state.loadFinishedAt = 0; state.fromSaved = 0; state.saveNote = ''
   srcFilter.off = loadFilter(); coverage.data = {}; fvMemo.clear(); itemsMemo.clear(); healthMemo.clear(); xMemo.clear(); statsMemo.clear(); xUi.imp = null; xUi.q = ''; $('#xSearch').value = ''; buildSources()
   $('#dlCard').hidden = true; $('#lineagePrompt').hidden = true; $('#dlReopen').hidden = true
   await loadCache()
@@ -174,6 +175,7 @@ function disconnect() {
   state.run?.abort.abort(); state.loadAbort?.abort(); state.dl?.abort.abort()
   if (state.reauth) { state.reauth.reject(Object.assign(new Error('Disconnected.'), { auth: true })); state.reauth = null }
   state.token = ''; state.run = null; state.assets = { 1: null, 2: null }; state.events = null; state.dl = null; state.loading = false; state.findings = null
+  state.loadFinishedAt = 0; state.loadStartedAt = 0; state.fromSaved = 0; state.saveNote = ''; state.saving = false; state.local = null; state.cache = { lineage: {} }
   $('#reauth').hidden = true; $('#statusBar').hidden = true
   $('#appView').hidden = true; $('#loginCard').hidden = false; $('#results').hidden = true
   document.title = 'Lineage Scan'
@@ -286,7 +288,7 @@ async function startLoad({ force = false } = {}) {
       else state.assets[t] = a
     }
   } catch (err) { if (err.name !== 'AbortError') throw err } finally { clearInterval(timer) }
-  if (ac.signal.aborted) { state.loading = false; return }
+  if (ac.signal.aborted) { if (state.loadAbort === ac) state.loading = false; return }   // a newer load (another site) owns the flag now
   const usedSaved = [1, 2].filter((t) => state.assets[t].savedAt)
   state.fromSaved = usedSaved.length ? Math.min(...usedSaved.map((t) => state.assets[t].savedAt)) : 0
   const liveTypes = [1, 2].filter((t) => !state.assets[t].savedAt && state.assets[t].done)
@@ -557,7 +559,7 @@ function renderStatus() {
   } else if (run && ['finding', 'lineage', 'running'].some((s) => String(run.status).startsWith(s))) {
     text = `Keyword scan: ${run.status === 'lineage' ? `lineage ${run.done.toLocaleString()} of ${run.columns.length.toLocaleString()}` : run.status}`
     time = fmtDur((Date.now() - run.startedAt) / 1000); pct = run.columns.length ? run.done / run.columns.length * 100 : null
-  } else if (state.loadFinishedAt) {
+  } else if (state.loadFinishedAt && state.assets[1] && state.assets[2]) {
     const a1 = state.assets[1], a2 = state.assets[2]
     const failed = [1, 2].filter((t) => state.assets[t]?.error && !state.assets[t].done).map((t) => TYPE_NAME[t])
     text = (failed.length ? `Could not load ${failed.join(' or ')} assets (see the message above) · ` : '') + `Loaded ${a2.total.toLocaleString()} column-level and ${a1.total.toLocaleString()} cross-system assets` + (() => {
