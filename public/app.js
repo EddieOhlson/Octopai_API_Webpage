@@ -906,7 +906,22 @@ async function lineageRaw(key, assetType, direction, signal) {
   const truncated = (r.nodes || []).length >= limit
   const nodes = (r.nodes || []).filter((n) => n && pick(n, '_key', 'rid', 'objectGUID') !== key && !n.isStartNode).map(summarizeNode)
   const edges = (r.edges || r.links || []).map((e) => [pick(e, '_from', 'FromRid', 'from'), pick(e, '_to', 'ToRid', 'to')])
+  fillHops(key, direction, nodes, edges)
   return { nodes, edges, truncated }
+}
+// Octopai does not always put a hop number on each node (it then reads as 0). Work it out from the edges instead:
+// the number of links between the start asset and the node, following the lineage direction (1 = upstream, 2 = downstream).
+function fillHops(key, direction, nodes, edges) {
+  if (!edges.length || nodes.every((n) => n.depth > 0)) return
+  const next = new Map()
+  for (const [from, to] of edges) {
+    const [a, b] = direction === 1 ? [to, from] : [from, to]
+    if (!a || !b) continue
+    if (!next.has(a)) next.set(a, []); next.get(a).push(b)
+  }
+  const hop = new Map([[key, 0]]); let q = [key]
+  while (q.length) { const nq = []; for (const a of q) for (const b of next.get(a) || []) if (!hop.has(b)) { hop.set(b, hop.get(a) + 1); nq.push(b) } q = nq }
+  for (const n of nodes) if (!(n.depth > 0)) n.depth = hop.get(n.key) || 1
 }
 function summarizeNode(n) {
   const p = n.properties || {}
@@ -917,7 +932,7 @@ function summarizeNode(n) {
     connection: flat.connection || p.ConnectionName || '',
     db: flat.db || p.DB || '', schema: flat.schema || p.Schema || '', table: flat.table || p.Table || '',
     tool: flat.tool || n.tool || p.ToolName || '', type: String(pick(n, 'toolType') || n.type || p.ToolType || ''),
-    depth: Number(n.depth ?? 0),
+    depth: Number(pick(n, 'depth', 'level', 'hop', 'hops', 'distance') ?? 0) || 0,
   }
 }
 // Keyword-scan version: uses the 24 hour cache.

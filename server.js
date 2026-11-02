@@ -309,6 +309,14 @@ async function localRoute(req, res) {
 
 // Report coverage: for every asset with saved downstream lineage, the distinct tool/tool-type pairs it reaches.
 // The page decides which of those count as reports (using categories.js). Later downloads override earlier ones.
+// Older downloads have no hop number on the nodes: count the links from the start asset along the edges instead.
+function longestHop(key, edges) {
+  const next = new Map()
+  for (const e of edges) { const [a, b] = e; if (!a || !b) continue; if (!next.has(a)) next.set(a, []); next.get(a).push(b) }
+  const seen = new Set([key]); let q = [key], d = 0
+  while (q.length) { const nq = []; for (const a of q) for (const b of next.get(a) || []) if (!seen.has(b)) { seen.add(b); nq.push(b) } if (nq.length) d++; q = nq }
+  return d
+}
 const covMemo = new Map()
 async function coverageFor(tenant, t) {
   const dir = path.join(DATA, 'exports', tenant)
@@ -318,9 +326,10 @@ async function coverageFor(tenant, t) {
   const memoKey = `${tenant}|${t}`, memo = covMemo.get(memoKey)
   if (memo && memo.sig === sig) return memo.out
   const keys = {}
-  const add = (key, nodes, truncated) => {
+  const add = (key, nodes, truncated, edges) => {
     const s = new Set(); let md = 0
     for (const n of nodes || []) { s.add(`${n.tool || ''}\u0001${n.type || ''}`); if (Number(n.depth) > md) md = Number(n.depth) }
+    if (!md && edges && edges.length) md = longestHop(key, edges)
     keys[key] = { c: [...s], tr: truncated ? 1 : 0, md }
   }
   if (t === 2) for (const [k, v] of Object.entries(cacheLineage(tenant))) { const i = k.lastIndexOf('|'); if (k.slice(i + 1) === '2') add(k.slice(0, i), v.nodes, v.truncated) }
@@ -328,7 +337,7 @@ async function coverageFor(tenant, t) {
     for await (const line of readline.createInterface({ input: fs.createReadStream(path.join(dir, name)) })) {
       if (!line.trim()) continue
       let g; try { g = JSON.parse(line) } catch { continue }
-      if (Number(g.t) === t && g.dir === 'downstream' && !g.error && g.key) add(g.key, g.nodes, g.truncated)
+      if (Number(g.t) === t && g.dir === 'downstream' && !g.error && g.key) add(g.key, g.nodes, g.truncated, g.edges)
     }
   }
   const out = { count: Object.keys(keys).length, keys }
